@@ -1,0 +1,4421 @@
+dim ver$(22)
+
+ver$="V2.20 (02 Jul 2018)"
+
+' startup message
+syslog "BCL SIP Client " + ver$ + " started."
+
+' Used file handles
+' Do not change them! (for now)
+#define X8_COM_PORT 		0	' X8 COM port RW handle
+#define SIP_CONTROL_STREAM	1	' SIP control messages handle
+#define COM_PORT		2	' Command interface COM port
+#define UDP_CONTROL_STREAM	3	' UDP control interface handle
+#define RTP_STREAM		4	' audio handle
+#define TCP_CONTROL_STREAM	5	' TCP control interface handle
+#define BGM_STREAM		6	' BGM audio handle
+#define RINGING_STREAM		6	' reuse the same handle for ringing
+#define AUDIO_STREAM 		7	' device audio stream
+#define CGI_STREAM		8	' fake cgi stream. We never need to open that type of
+                                        ' handle, we just need a number to note CGI
+#define EEPROM_SETUP_STREAM	9	' eeprom setup RW handle
+#define NOTIFY_STREAM		10	' priority port stream
+#define SERIAL_GW_STREAM	11	' serial GW stream
+#define UDP_GW_STREAM		12	
+#define TCP_GW_STREAM		13
+
+' define shared timers
+#define PICKUP_TIMER		4
+#define CLOSE_ON_TIMEOUT_TIMER	5
+
+' define SIP profiles
+#define PROFILE_SIP_PHONE		0
+#define PROFILE_SIP_DOORSTATION		1
+#define PROFILE_SIP_PAGING_POINT	2
+#define PROFILE_SIP_GATEWAY		3
+#define PROFILE_SIP_MONITORING_POINT	4
+
+' define HDX/AI_PHONE states
+#define HDX_MODE_AUDIO_OFF	0
+#define HDX_MODE_TALK		1
+#define HDX_MODE_LISTEN		2
+
+' Gateway type
+#define GW_TYPE_PASSIVE		1
+#define GW_TYPE_ACTIVE		2
+
+' HW Types
+#define HW_ANNUNCICOM_100	7	' Annuncicom 100
+#define HW_IPAM_100         13	' IPAM 100
+#define HW_EXSTREAMER_100	14	' Exstreamer 100 (as receiver only)
+#define HW_EXSTREAMER_200	15	' Extreamer 200 (as receiver only)
+#define HW_CARRIER_IPAM_100	16	' IPAM 100 Carrier Board
+#define HW_ANNUNCICOM__1000	17	' Annuncicom 1000 (additional features)
+#define HW_ANNUNCICOM_200	19	' Annuncicom 200
+#define HW_EXSTREAMER_110	20	' Extreamer 110 (as receiver only)
+#define HW_ANNUNCICOM_PS_16	25	' Annuncicom PS16
+#define HW_ANNUNCICOM_155	32	' Annuncicom 155
+#define HW_EXSTREAMER_120	34	' Extreamer 120 (as receiver only)
+#define HW_EXSTREAMER_P5	36	' IP Speaker (Exstreamer P5, as receiver only)
+#define HW_EXSTREAMER_205	38	' Exstreamer 205 (as receiver only)
+#define HW_IPAM_102         40  ' IPAM 102
+#define HW_ANNUNCICOM_60	41	' Annuncicom 60
+#define HW_ANNUNCICOM_PS1	42	' Annuncicom PS1
+
+
+' serial GW variables
+dim udp_gw_port			' UDP port for serial to UDP GW
+dim udp_gw_init
+dim udp_gw_len,tcp_gw_len,ser_gw_len
+dim udp_lock_to			' UDP remote host timeout (if gw_ip$ not specified)
+dim tcp_gw_port			' TCP port for serial to TCP GW
+dim tcp_retry_tm,tcp_retry_to
+dim gw_type
+dim gw_ip$(16)			' IP address for active serial to TCP port
+dim rmt_udp_gw_port		' the remote UDP port of the sender
+dim tmp_rmt_gw_port
+dim rmt_udp_gw_ip$(16)		' the remote ip of the UDP sender to lock (if gw_ip$ not specified)
+dim tmp_rmt_gw_ip$(16)
+dim pser_gw			' serial GW data check timer (25-30 ms)
+dim last_valid_udp_pkt_tm	' timestamp of the last packet received from the locked remote host
+udp_lock_to=10000		' Default-10 seconds
+tcp_retry_to=10000
+rmt_udp_gw_ip$="0.0.0.0"
+dim sip_display_id$(17)
+
+' HW related variables
+dim htype				' device hardware type
+dim hw_types(15)			' HW type array
+dim num_inputs				' number of digital inputs of the device
+dim num_relays				' number of relays available on the device
+
+' the most important thing is the HW type detection, do it at the very beginning !
+' supported hardware
+hw_types(0) = HW_ANNUNCICOM_100
+hw_types(1) = HW_IPAM_100	
+hw_types(2) = HW_EXSTREAMER_100     
+hw_types(3) = HW_EXSTREAMER_200
+hw_types(4) = HW_CARRIER_IPAM_100
+hw_types(5) = HW_ANNUNCICOM__1000
+hw_types(6) = HW_ANNUNCICOM_200
+hw_types(7) = HW_EXSTREAMER_110
+hw_types(8) = HW_ANNUNCICOM_PS_16
+hw_types(9) = HW_ANNUNCICOM_155
+hw_types(10)= HW_EXSTREAMER_120
+hw_types(11)= HW_EXSTREAMER_P5
+hw_types(12)= HW_EXSTREAMER_205
+hw_types(13)= HW_ANNUNCICOM_60
+hw_types(14)= HW_ANNUNCICOM_PS1	
+hw_types(15)= HW_IPAM_102
+
+htype = iostate(60000)
+hindex= find (htype, hw_types) 
+
+if or(htype=0,hindex<0) then
+	syslog "Unknown HW type= " + sprintf$("%u", htype) +" detected, assuming Annuncicom 100"
+	htype=HW_ANNUNCICOM_100		' default to Ann 100 if htype unknown
+else
+	syslog "HW type detected: " + sprintf$("%u", htype)
+endif
+
+syslog "Detected IPAM ID: " + str$(iostate(60008))
+
+num_relays=iostate(60002)
+num_inputs=iostate(60004)
+
+' PS16 variables
+dim ps16_key
+dim ps_state
+
+' REFER method variables
+dim refer_en		' enable the Blind Call Functionality
+dim refer_button, x8_button	
+dim on_hold			' ON HOLD flag
+
+dim call_start_button   ' if we want to transfer call with a button press
+                        ' store here the button that initiated the running call.
+                        ' pressing any other button will transfer the call to 
+                        ' the initiated target instead of closing the call
+                        ' Used together with refer_button=1
+dim msg_body_len
+dim sipfrag$(100)       ' The SIPfrag from the NOTIFY message. For now not really used,
+                        ' it is just printed when debug is enabled. For future use (for
+                        ' implementing REFER also in P2P)
+dim transfer_to$(33)    ' The peer ID to which the call is to be transferred to
+dim refer_from$(130)    ' used to construct the REFER message
+dim temp_cgi$(40)       ' temp string to store the feedback to the "F" command
+
+' various temp variables
+dim last_pkt            ' store the timestamp of the last decoded RTP packet
+dim ps16_tmp            ' store the position of "<" and ">" chars when searching in a
+                        ' remote party ID string
+dim start_bracket,close_bracket
+
+
+' status messages
+dim s180	<gosub 1100>	' "Ringing" status
+dim s200	<gosub 1140>	' "OK" status
+dim s202 	<gosub 1150>	' "Accepted" status
+dim s603	<gosub 1300>	' "Rejected" status
+dim s481	<gosub 1350>	' "Call leg/Transaction Not Existing"
+dim s486	<gosub 1400>
+
+' status variables for the webUI
+dim svol		' status volume
+dim spoll		' status peak out level left
+dim spolr		' status peak out level right
+dim spill		' status peak in level left
+dim spilr		' status peak in level right
+dim sregt		' time till next registration
+dim sa155_spk$(25)	' Annuncicom 155 speaker
+dim spk_test_en		' Enable/disable speaker test (set from the webUI using BAS.cgi
+dim spk_test_tmr	' speaker test timer (we need 10 seconds for measurement)
+dim sa155_temp		' Annuncicom 155 temperature sensor
+dim sa155_mic$(25)	' Annuncicom 155 microphone
+dim sweb$(10)		' Web UI status string
+dim srmt_party$(100)	' remote party in a call
+dim ps16_rmt$(100)
+dim sup_inputs		' supervised inputs of Ann155 (bit 2 from the iostate: 2: shorted, 3: disconnected)
+dim q2			' temp storage while getting sup_inputs
+dim sreg		' registration status (0 - not registered, 1 - registering, 2 - registered)
+sreg=0
+dim reg_time	' default registration time
+
+' HDX and aiphone variables
+dim hdxen				' HDX enabled?
+dim hdx_state				' HDX state (talk/listen)
+dim aiphone_enable                      ' aiphone available? Read from EEPROM
+dim hdx_mode <gosub 4200>                 ' adjust HDX/AI_Phone  mode
+dim aiphone_tm                          ' AI phone phantom button timer
+dim aiphone_state	                ' AI phone state. Must be the same as hdx_state
+dim hdx_receive_tm			' receive timeout
+dim hdx_level_buffer$(10)		' buffer to read the audio levels
+dim hdx_level_right, hdx_level_left	' variables to remember left and right channel audio levels
+dim hdx_level_threshold			' HDX VAD level threshold
+dim vadto				' voice activity detection timeout
+dim aec					' acoustic echo cancellation (AEC)
+
+' close on level variables
+dim levbf$(10)		' voice level fake read buffer
+dim levrc,levlc		' current left and right closing levels
+dim levto		' close on level timeout
+dim levtm		' close on level timer
+dim clsol		' close on level
+dim l_read
+dim l_send
+
+' Record-Route processing variables:
+dim route_i,route_x	' temp variables for parsin th the rrout$
+dim route_ip$(30)	' last detected route IP
+dim sub_rrout$(400)	
+
+' requests messages
+dim rREG	<gosub 1500>
+dim rINV	<gosub 1510>
+dim rACK	<gosub 1520>
+dim rBYE	<gosub 1530>
+dim rCAN	<gosub 1540>
+dim rREF	<gosub 1550>
+
+' volume set routine
+dim current_volume		
+dim setvol	<gosub 9300>	
+
+' other custom functions
+dim keyin 	<gosub 5004 >
+dim authn 	<gosub 20100>
+dim x8chk 	<gosub 30000>
+dim x8swp	<gosub 30005>
+dim x8get	<gosub 30010>
+dim x8wrt 	<gosub 30030>
+dim mbcrc 	<gosub 30100>
+dim cmdin 	<gosub 31000>
+dim asc2hex 	<gosub 32300>	' convert from ascii to hex
+dim reset_timer <gosub 32350>	' resets close_on_tm and pktm (share timer 4)
+dim stop_timer  <gosub 32360>	' stop/disable one of the shared timers
+dim message	<gosub 25000>   ' print a message on the PS16 display
+dim process_pbx_list	<gosub 9350>
+dim set_active_pbx	<gosub 9500> ' set the active PBX
+
+dim x8tmp$(50)			' temp variable for reading from x8
+dim x8init$(25)			' X8 com port init string
+
+' general variables
+dim regto			' re registration timeout
+dim temp$(1400)			' temp string for general use
+dim dial$(32)			' variable to read the ID to be dialed from the EEPROM
+dim stp$(256)			' string to read from EEPROM
+dim i, x, y, z			' loop variables
+dim receive_stream		' used to replace z in 9100
+dim inprt
+
+' avoiding race conditions from timers
+dim q, v, l
+
+'[AD 15.10.2008]
+dim sprt$(24)
+dim rebr$(16)
+dim ist, rst, isto
+dim x8, x8io, x8is, x8iso, x8os, x8num$
+dim x8try		' number of tries to detect X8 at boot
+x8try=3			' max 3 tries at boot
+dim plow, pmed, px8_keypress
+dim xout
+dim udpap, tcpap	' UDP and TCP interface ports
+dim apiin		' detect from which API (udp,tcp,com, cgi) we get a command
+dim rebp, bgmen
+dim _CGI_$(32)
+dim serial_api_en	' serial control interface enabled (replaces rb(_serap_)
+dim relay_on		' relay on variable (replaces rb(_relon_)
+dim rel_on_ring		' relay on while ringing on incoming call
+dim rebon		' rebroadcast enable (replaces rb(_rebon_)
+dim beep_out_answer	' enable (1) or disable (0) beep answer when outgoing call is answered
+dim beep_in_answer	' enable (1) or disable (0) beep answer when incoming call is answered
+
+dim rtpin$(16)
+dim temp_host$(16)
+
+dim dbgtx$(7)
+dim dbgrx$(7)
+dim dbgbp$(7)
+
+dim uselink
+dim dstlnk(1,1)
+dim bufflevel
+
+dbgrx$ = "[IN ] "
+dbgtx$ = "[OUT] "
+dbgbp$ = "[OBP] "
+
+' IO state initial
+gosub 20500 : isto=ist
+
+open "STP:0" as EEPROM_SETUP_STREAM : read EEPROM_SETUP_STREAM, stp$ : close EEPROM_SETUP_STREAM
+sprt$="COM:"
+
+x=midget(stp$,82,1)
+' speed
+if x=0  then sprt$=sprt$+"38400,"
+if x=1  then sprt$=sprt$+"19200,"
+if x=2  then sprt$=sprt$+"9600,"
+if x=3  then sprt$=sprt$+"4800,"
+if x=4  then sprt$=sprt$+"2400,"
+if x=5  then sprt$=sprt$+"1200,"
+if x=6  then sprt$=sprt$+"600,"
+if x=7  then sprt$=sprt$+"300,"
+if x=8  then sprt$=sprt$+"115200,"
+if x=9  then sprt$=sprt$+"57600,"
+if x=10 then sprt$=sprt$+"230400,"
+if x=11 then sprt$=sprt$+"76800,"
+
+x=midget(stp$,81,1)
+' parity
+if and(x,&H30)=0 then sprt$=sprt$+"N,"
+if and(x,&H30)=&H30 then sprt$=sprt$+"E,"
+if and(x,&H30)=&H10 then sprt$=sprt$+"O,"
+' data bits
+if and(x,4) then sprt$=sprt$+"8," else sprt$=sprt$+"7,"
+' stop bits
+if and(x,128) then sprt$=sprt$+"2," else sprt$=sprt$+"1,"
+
+x=midget(stp$,83,1)
+' handshake
+if x=0 then sprt$=sprt$+"NON:"
+if x=1 then sprt$=sprt$+"SFW:"
+if x=2 then sprt$=sprt$+"HDW:"
+if x=8 then sprt$=sprt$+"485:"
+
+sprt$=sprt$+"1"
+
+' ring timer
+dim rt
+
+'[AD 18.04.2008] all missing variables
+dim ringn
+
+'[AD 18.04.2008] force to get real public ip
+dim getip
+
+'Digest authentication variables
+dim a1$(33)
+dim a2$(33)
+dim realm$(33)
+
+'audio settings for rtp playback
+dim aurtp$(50)			' audio initialisation string for RTP mode
+dim ssrc			' RTP SSRC identificator
+dim mac$(13)			' 12 bytes MAC address
+
+'gets set to true if authentication is needed, 0 no, 1 Auth, 2 Proxy-Auth
+dim auth
+auth = 0
+
+'number of authentication tries - used if
+'the pbx doesn't return a 403 but replies with 401
+dim authr
+authr = 0
+
+'authorization information and parameters
+dim auth$(512)
+dim qop$(50)
+dim cnonce$(10)
+dim nc
+
+' incoming call flag
+dim incm
+
+' input levels
+dim levl,levr,levth,calol
+
+'active call status
+' 1 = no active call
+' 2 = initializing call (we are calling)
+' 3 = incoming call (they are calling)
+' 4 = call active
+' 5 = notification message active
+' 6 = play busy tone
+
+dim call, callp
+call=1
+
+'CSeq-ID variable, Non-Dialog and Dialog CSeq-ID counters, see Section 8.1.1.5 Cseq
+dim csqid
+dim csqnd
+dim csqd
+csqnd = 0
+csqd  = 0
+
+'CSeq method
+dim cseqm$(16)
+
+'CSeq-ID and CSeq method for the received INVITE
+dim invite_csqid
+dim invite_cseqm$(16)
+
+' dim out_invite_csqid
+' dim out_invite_cseqm$(16)
+
+dim incall_not_replied, outcall_not_replied
+
+'call tag id
+dim tag$(32)
+tag$=str$(random())
+
+'temporary cut variable
+dim cut$(1500)
+dim cfrom$(32)	'used in the cut function
+dim cto$(32) 	'used in the cut function
+dim cfld$(32)	'[AD 18.04.2008] used in collect function
+
+'[AD 18.04.2008] temporary collect variable
+dim col$(1400)
+
+'destination IP of the RTP stream
+dim dstip$(16)
+
+'destination port of the RTP stream
+dim dstp
+
+' temporary destination IP and port
+dim tmp_dstip$(16)
+dim tmp_dstp
+
+' variables to store the dest IP and port in the re_INVITE
+dim reinv_dstip$(16)
+dim reinv_dstp
+
+'time between dtmf messages
+dim dtmft
+
+'[AD 18.04.2008] Record-Route field
+dim rrout$(400)
+
+'authorization hash
+dim hash$(33)
+
+'last INFO cseq ID
+dim infid
+infid = 0
+
+'local IP address
+dim ip$(16)
+ip$=sprintf$("%A",1)
+
+'pulic ip address
+dim pubip$(16)
+
+'bypass URI address,, ip and port, for ACK and all the direct communications to UAS
+dim bpuri$
+dim bpip$(17)
+dim bpp
+
+'temp strings to store the bypass URI when sending 603 in p2p mode
+dim p2pbpip$(17)
+dim p2pbpp
+dim rmtip$(17)
+
+'last pressed telephone key
+'dim key$(2)
+' Some SIP phones insert parasitic space in the SIP INFO message before the
+' digit, then BCL complains about lost data during data assingment
+' increase it a bit more
+dim key$(5)
+
+'full key sequence pressed
+dim keys$(16)
+
+'Call-ID of the last SIP message sent
+dim lstid$(256)
+
+'URI of the last SIP message sent
+dim lsuri$(128)
+
+'[AD 13.05.2008]URI to build request in ACK response
+dim rmuri$(128)
+
+'time of the last RTP packet received
+'dim lsrtp	' commented, was used for the Exstreamer 10 seconds timeout on missing RTP
+		' which is now removed
+
+'SIP messages
+dim smsg$(1500)
+'last SIP message sent that needs to be retxted
+dim lssip$(1500)
+
+' Call ID strings
+dim regid$(128)		' registration Call ID string
+dim incid$(128)		' incall Call ID string
+dim initid$(128)	' the Call ID of the INVITE that has initiated the call setup	
+dim invid$(128)     ' current INVITE msg Call ID string
+dim out_invid$(128)	' current outgoing INVITE msg Call ID string
+dim ok_inv
+dim msg_type$(128)
+
+'SIP method
+dim meth$(16)
+
+'fields in a SIP message
+dim via$(512)
+dim from$(128)
+dim to$(128)
+dim calid$(128)
+
+dim inc_from$(128)	' incall From field
+dim inc_to$(128)	' incall To field
+
+' buffer fields for the incoming and outgoing INVITE messages
+dim invite_from$(128)
+dim invite_to$(128)
+dim out_invite_from$(128)
+dim out_invite_to$(128)
+
+
+'newline
+dim nl$(3)
+nl$ = "\r\n"
+
+'authorization fields
+dim nonce$(65)
+dim inuri$(128)
+
+'protocol and version
+dim protv$(8)
+protv$ = "SIP/2.0"
+
+'SIP request
+dim req$(16)
+
+'Maximum time of being in a call setup without answer
+dim rngto
+
+'marks an rtp end packet
+dim rtpe
+rtpe = 0
+
+'default rtp payload type number
+dim trpp
+trpp = 101
+
+'retx count
+dim retx
+retx = 0
+
+' dword branch
+dim brnch
+
+' ***************************************************************************************
+' application-specific setup variables
+' ***************************************************************************************
+
+dim p2p					'peer to peer mode
+dim sipp				'sip port
+dim rtpp				'rtp port
+dim user$(33)			'32 username (normally a phone number)
+dim auth_id$(33)        ' 32 bytes authentication ID (if used)
+dim pass$(33)			'32 password
+dim coi$				'call on device input
+dim clev$(33)
+dim uas$(65)			'64 destination, can also be user@pbx (trapezoid)
+dim pbx$(33)			'32 PBX (IP or hostname) to be used everywhere in the program
+dim pbx1$(33)			'PBX server 1
+dim pbx2$(33)			'PBX server 2
+dim nat					'send NAT keepalives, 0 = no, 1 = yes
+dim debug				'syslog messages, 1 enabled, 0 disabled
+
+' ***************************************************************************************
+' Share Timer 4 for pickup timer and close on timeout
+' Currently the resolution of timer 4 is 100 ms, change it as appropriate
+' ***************************************************************************************
+
+dim pkmod				' pick up mode
+dim pk_to				' pick up / hang up timeout
+dim pk_totm				' pickup timout timer. Set this value to _TMR_(0)
+                                        ' when starting it
+dim pk_toen				' pickup timer enable. When set to 0, simulates
+					' timer x, 0 statement
+dim close_on_to				' Close on timeout. Replaces the doorstation mode
+                                        ' (pktm=4), which has to be independent option
+					' 0 - disabled, > 0 - defines the timeout
+dim close_on_tm				' close on timeout timer. Set this value to _TMR_(0)
+                                        ' when starting it
+dim close_on_toen			' Close on timeout enable. Simulates timer x, 0
+                                        ' statement
+dim gcto,gctmr			' global call timeout and timer variables			
+dim cgi_available                       ' interrupt flag that CGI command is received
+dim process_tmr4, process_tmr5		' interrupt flags for timer 4 and 5 (need be processed
+                                        ' in the next BCL loop)
+
+dim lcktm				'door lock time
+dim doc$(9)				'door open code
+
+' ***************************************************************************************
+' loading eeprom values from EEPROM 1157
+' ***************************************************************************************
+open "STP:1157" as EEPROM_SETUP_STREAM
+read EEPROM_SETUP_STREAM,stp$
+close EEPROM_SETUP_STREAM
+
+midcpy pbx2$, 1,32,stp$,1
+refer_en=midget(stp$,34,1)
+
+open "STP:900" as EEPROM_SETUP_STREAM
+read EEPROM_SETUP_STREAM,stp$
+close EEPROM_SETUP_STREAM
+
+p2p 	= midget(stp$,1,1)
+sipp	= midget(stp$,2,2)
+rtpp	= midget(stp$,4,2)
+
+midcpy user$,1,32,stp$,6
+midcpy pass$,1,32,stp$,39
+midcpy clev$,1,32,stp$,71
+midcpy sip_display_id$,1,16,stp$,103
+midcpy pbx1$,1,32,stp$,121
+midcpy auth_id$,1,32,stp$,225
+
+syslog "PBX1:"+pbx1$
+
+nat	= midget(stp$,154,1)
+debug = midget(stp$,155,1)
+
+' rebroadcast ?
+rebp  = midget(stp$,176,2)
+if rebp then
+	rebon=1
+	rebr$ = sprintf$("%lA", midget(stp$,172,4))
+endif
+
+aec=midget(stp$,223,1)
+if aec then syslog "AEC is enabled!"
+
+beep_out_answer=midget(stp$,224,1)
+beep_in_answer=and(beep_out_answer,&H02)	' take bit 1 of byte 1123
+beep_out_answer=and(beep_out_answer,&H01)	' take bit 0 of byte 1123
+
+' priority stream variables
+dim notif_port		' notification audio port
+dim notif_vol		' notification audio volume
+dim notif_addr$(16)	' notification audio source address (IP)
+dim notif_buff		' notification audio RTP buffer level
+dim notif_en		' notification enabled flag (receiving priority audio message)
+dim notif_stat$(10)	' fake buffer to read the zero count from the audio interface
+dim notif_rtp$(50)	' notification audio open string
+dim notif_pload		' notification message RTP payload
+dim notif_len		' temp storage for the lastlen(NOTIFY_STREAM)
+dim notif_prio		' notification message priority (0-high, stops any SIP call, 1-low, cannot interrupt SIP call)
+dim notif_mode		' 0 - mono, 1 - stereo
+dim notif_next_tm	' the timeout till the next notification stream payload check. Used to block checking
+			' in case of getting a stream with unsupported RTP payload
+dim notif_pkt_tm	' timestamp of the last received notification audio packet. Used to replace the
+                    ' unreliable stream timeout detection mechanizm
+dim notif_relay		' Notification relay. If set to "Yes" (1), then it uses the configured relay_on
+dim notify_dest(1,1)	' Notification message LINK command destination array
+dim notif_party$(100)	' Temp string to store the notification message source ip:port
+			
+dim payloads(21)	' list of the supported RTP payload types
+payloads(0)  =  0	' uLaw 8kHz
+payloads(1)  =  8	' aLaw 8kHz
+payloads(2)  = 10 	' PCM 44.1kHz MSB signed stereo
+payloads(3)  = 11	' PCM 44.1kHz MSB signed mono
+payloads(4)  = 14	' MP3
+payloads(5)  = 96	' PCM 8kHz MSB signed mono
+payloads(6)  = 97	' uLaw 24kHz mono
+payloads(7)  = 98	' aLaw 24kHz mono
+payloads(8)  = 99	' PCM 24kHz MSB signed mono
+payloads(9)  =100	' uLaw 32kHz mono
+payloads(10) =101	' aLaw 32kHz mono
+payloads(11) =102	' PCM 32kHz MSB signed mono
+payloads(12) =103	' PCM 48kHz MSB signed stereo
+payloads(13) =104	' PCM 8kHz LSB signed mono
+payloads(14) =105	' PCM 24kHz LSB signed mono
+payloads(15) =106	' PCM 32kHz LSB signed mono
+payloads(16) =107	' PCM 44.1kHz LSB signed stereo
+payloads(17) =108	' PCM 48kHz LSB signed stereo
+payloads(18) =109	' uLaw 12kHz mono
+payloads(19) =110	' aLaw 12kHz mono
+payloads(20) =111	' PCM 12kHz MSB signed mono
+payloads(21) =112	' PCM 12kHz LSB signed mono
+dim index		' variable to store the payload type index if found in payloads array
+
+notif_port=midget(stp$,198,2)
+
+if notif_port>0 then 
+	notif_vol=midget(stp$,204,1)
+	notif_addr$ = sprintf$("%lA",midget(stp$,200,4))
+	notif_buff = midget(stp$,205,2)
+	notif_prio = midget(stp$,207,1)
+	notif_relay= midget(stp$,208,1)
+	if debug then 
+		if notif_prio=0 then
+			syslog "High priority notification messages at "+ &
+				notif_addr$+":"+str$(notif_port)+", volume:"+str$(notif_vol)+ &
+				", buffer: "+str$(notif_buff)+" ms"
+		else
+			syslog "Low priority notification messages at "+ &
+				notif_addr$+":"+str$(notif_port)+", volume:"+str$(notif_vol)+ &
+				", buffer: "+str$(notif_buff)+" ms"
+		endif
+	endif
+endif
+
+' DNS renewal variables
+dim dns_renew		' enable/disable the dns renewal
+dim dns_pending		' flag to note that the registration failed, and we 
+				' have to renew DNS before registering again
+dim reg_start_time	' mark when the registration started
+dim reg_fail_to		' timeout to wait until we assume it is failed if no reply
+
+dns_renew=midget(stp$,217,1)
+dns_pending=0
+reg_fail_to=midget(stp$,218,1) * 1000	' convert in ms
+
+dim stream_timeout	' tmeout after which the client should drop the call if no incoming stream
+                        ' NB! Make sure it is disabled when Monitor Mode is selected
+dim call_start_time     ' the time the call has started
+dim sip_profile         ' active profile (selected from the webUI)
+
+sip_profile = midget(stp$,189,1)
+stream_timeout=midget(stp$,219,2) * 60000	' convert from mins to ms
+
+' some features are not supported in all profiles, check them here
+if and(sip_profile = PROFILE_SIP_MONITORING_POINT, stream_timeout > 0) then
+	syslog "WARNING!!! Stream Timeout should not be set in Monitor Mode, disabling it ..."
+	stream_timeout=0
+endif
+
+' Blind Call Transfer supported only in SIP Phone profile... 
+if and(sip_profile <> PROFILE_SIP_PHONE, refer_en <> 0) then
+	syslog "WARNING!!! Blind Call Transfer is supported only in SIP Phone mode, disabling it ..."
+	refer_en=0
+endif
+
+' ...and only in SIP mode (no P2P)
+if and(refer_en <> 0, p2p <> 0) then
+	syslog "WARNING!!! Blind Call Transfer is not supported in P2P mode, disabling it ..."
+	refer_en=0
+endif
+
+if refer_en <> 0 then refer_button=1	' FIXME: Do we really need this flag?
+	
+' read the default REGISTER time
+reg_time=midget(stp$,221,2)
+if debug then syslog "Default REGISTER Time = "+str$(reg_time)+" seconds"
+if reg_time<60 then 
+	reg_time=60
+	syslog "Default REGISTER Time too short, fixing to "+str$(reg_time)+" seconds ..."
+endif
+if reg_time>3600 then 
+	reg_time=3600
+	syslog "Default REGISTER Time too long, fixing to "+str$(reg_time)+" seconds ..."
+	
+endif
+
+' BGM variables
+dim bgmport		' BGM port
+dim bgmad$(16)	' BGM address
+dim bgmvol		' BGM volume
+dim bgmbuff		' BGM RTP buffer
+dim bgm_dest(1,1)	' BGM LINK command destination array
+
+bgmport=midget(stp$,182,2)
+
+if bgmport > 0 then
+	bgmad$ = sprintf$("%lA",midget(stp$,178,4))
+	bgmvol=midget(stp$,184,1)
+	bgmbuff=midget(stp$,186,2)
+	if debug then syslog "BGM at "+bgmad$+":"+str$(bgmport)+", volume:"+str$(bgmvol)+", buffer: "+str$(bgmbuff)+" ms"
+endif
+
+'phone pickup mode
+'0 = direct (auto answer immediately)
+'1 = auto answer after xx seconds if not answered with a button press
+'2 = auto hangup after xx seconds if not answered with a button press
+'3 = not callable
+'4 = ignore button press, hang up after timeout (door station mode) --> moved to close_on_to
+
+pkmod = midget(stp$,156,1)
+pk_to  = midget(stp$,157,1) * 1000	' convert in ms
+close_on_to = midget(stp$,191,1) * 1000 ' convert in ms
+syslog "Auto Hangup Time: "+str$(close_on_to)+" seconds"
+
+' configure relays
+relay_on = midget(stp$,188,1)		' get relay number to switch on at call answer
+' bit 7 of relay_on defines if relay has to be enabled at incoming call ring (1), or at call answer (0)
+if and(relay_on,&H80)=&H80 then
+	rel_on_ring=and(relay_on,&H0F)	' enable the relay to switch on call ring
+	relay_on=0			' disable relay switching at call answer
+else
+	rel_on_ring=0			' disable the relay to switch on call ring
+	relay_on=and(relay_on,&H0F)	' enable the relay to switch on call answer
+endif
+' check for invalid relay number
+if or(rel_on_ring > num_relays, relay_on > num_relays) then
+	' always one of the rel_on_ring or relay_on is 0, so we can use their sum
+	' to print which relay is selected
+	syslog "Invalid relay number " + str$(relay_on+rel_on_ring)+" configured to use, ignoring!"
+	rel_on_ring=0
+	relay_on=0
+endif
+if debug then
+	if relay_on > 0 then syslog "Relay "+str$(relay_on)+" will switch on call answer"
+	if rel_on_ring > 0 then syslog "Relay "+str$(rel_on_ring)+" will switch on incoming call ring"
+endif
+
+' HDX mode parameters
+
+hdxen=midget(stp$,192,1)
+
+if hdxen>0 then
+	if debug then syslog "SIP client configured in HDX mode"
+	aiphone_enable=midget(stp$,193,1)
+	vadto=midget(stp$,196,2) : syslog "VAD timeout: "+str$(vadto)
+	hdx_level_threshold=midget(stp$,194,2) : syslog "HDX level threshold: "+str$(hdx_level_threshold)
+endif
+
+' close call on level parameters
+levto = midget(stp$,190,1) * 1000	' convert in miliseconds
+if levto then clsol=1			' 0 timeout-close on level is disabled, otherwise enabled
+
+' API support
+udpap = midget(stp$,168,2)
+tcpap = midget(stp$,170,2)
+
+midcpy doc$,1,8,stp$,158
+
+lcktm = midget(stp$,167,1) * 10		' pulse the relay in lcktm*100 ms
+
+
+' serial port 0 set for X8 or for the API ?
+serial_api_en=midget(stp$,185,1)
+gw_ip$=sprintf$("%lA",midget(stp$,209,4))
+udp_gw_port=midget(stp$,213,2)
+tcp_gw_port=midget(stp$,215,2)
+
+if and(debug > 0,serial_api_en > 1) then
+'	syslog "Serial GW ip: " + gw_ip$
+'	syslog "UDP GW port : " + str$(udp_gw_port)
+	syslog "TCP GW port : " + str$(tcp_gw_port)
+endif
+
+if serial_api_en = 0 then
+	' Use COM port for X8
+	if htype=HW_ANNUNCICOM_155 then
+		' There is no RS232 port on Ann155, only RS485
+		' on COM2
+		x8init$ = "COM:19200,E,8,1,485:2"
+	else
+		' use RS232 on COM1
+		x8init$ = "COM:19200,E,8,1,NON:1"
+	endif
+
+	' X8 check
+	if debug then syslog "Control Interface and Serial GW DISABLED! "
+001	x8 = x8chk()
+	' sometimes the first read is invalid, so try again
+	if and(x8 < 1, x8try > 0) then x8try = x8try - 1  : goto 001
+
+	if x8 then
+		x8io  = x8get(275)
+		x8is  = x8get(1) : x8iso = x8is
+		x8os  = x8get(0)
+		open "STP:1200" as EEPROM_SETUP_STREAM : read EEPROM_SETUP_STREAM, x8num$ : close EEPROM_SETUP_STREAM
+	else
+		syslog "X8 not connected"
+	endif
+endif
+
+if serial_api_en = 1 then
+	' Using COM port 1 as control interface
+	if debug then syslog "Control Interface ENABLED"
+	open sprt$ as COM_PORT : sprt$ = ""
+endif
+
+' UDP GW not validated yet, disable for now
+'if serial_api_en = 2 then
+'	' UDP to serial GW
+'	if debug then syslog "UDP Serial GW ENABLED"
+'	if udp_gw_port>0 then
+'		open sprt$ as SERIAL_GW_STREAM : sprt$ = ""
+'		if mediatype(SERIAL_GW_STREAM) then
+'			' open UDP handle
+'			open "UDP:"+gw_ip$+":" + str$(udp_gw_port) as UDP_GW_STREAM
+'			if gw_ip$="0.0.0.0" then 
+'				syslog "WARNING: Gateway address not set, any host can send UDP data!"
+'				gw_type=GW_TYPE_PASSIVE
+'			endif
+'			if mediatype(UDP_GW_STREAM)=0 then 
+'				syslog "ERROR: UDP handle not opened, cannot establish serial GW!"
+'				close SERIAL_GW_STREAM
+'			endif
+'		else
+'			syslog "Opening COM port failed, cannot establish serial GW!"
+'		endif
+'	else
+'		syslog "ERROR: UDP port not set, aborting serial GW initialization! "
+'	endif
+'endif
+
+if serial_api_en = 3 then
+	' Passive TCP to serial GW
+	
+	if tcp_gw_port>0 then
+		if debug then syslog "Passive TCP Serial GW ENABLED"
+		
+		open sprt$ as SERIAL_GW_STREAM : sprt$ = ""
+		if mediatype(SERIAL_GW_STREAM)=0 then 
+			syslog "Opening COM port failed, cannot establish serial GW!"
+		else
+			open "TCP:0.0.0.0:"+str$(tcp_gw_port) as TCP_GW_STREAM
+			syslog "Opening Passive TCP socket:0.0.0.0" + str$(tcp_gw_port)
+			if mediatype(TCP_GW_STREAM) = 0 then 
+				syslog "TCP handle could not be opened, aborting!"
+				close SERIAL_GW_STREAM
+			endif
+		endif
+	else
+		syslog "ERROR: TCP port not set, aborting serial GW initialization! "
+	endif
+endif
+
+if serial_api_en = 4 then
+	' Active TCP to serial GW
+	if and(tcp_gw_port>0, gw_ip$ <> "0.0.0.0") then
+		if debug then syslog "Active TCP Serial GW ENABLED"
+		
+		open sprt$ as SERIAL_GW_STREAM : sprt$ = ""
+		if mediatype(SERIAL_GW_STREAM)=0 then 
+			syslog "Opening COM port failed, cannot establish serial GW!"
+		else
+			open "TCN:"+gw_ip$+":"+str$(tcp_gw_port) as TCP_GW_STREAM
+			syslog "Opening Active TCP socket: " +gw_ip$ + ":" + str$(tcp_gw_port)
+			if mediatype(TCP_GW_STREAM) = 0 then 
+				syslog "TCP handle could not be opened, aborting!"
+				close SERIAL_GW_STREAM
+			endif
+		endif
+	else
+		syslog "ERROR: TCP socket "+gw_ip$+":"+str$(tcp_gw_port)+"not valid, aborting serial GW initialization! "
+	endif
+endif
+
+
+
+' ***************************************************************************************
+' input checks
+' ***************************************************************************************
+
+' user and password must be set
+if len(user$)= 0 then gosub 20000
+'if p2p=0 then
+'	if len(pass$)= 0 then gosub 20000
+'endif
+'at PBX1 must be always must be set
+if and(len(pbx1$)=0,p2p=0) then gosub 20000
+
+'PBX (IP)
+dim pbxp
+dim pbxip$(17)
+dim pbxp1,pbxp2
+dim pbxi1,pbxi2,active_pbx
+
+if p2p=0 then
+	active_pbx=0
+	process_pbx_list()
+else
+	pbxp = 5060
+endif
+
+
+
+' set defaul uas$ as call on level
+uas$ = clev$ : gosub 9030
+
+'default ports
+if sipp = 0 then sipp = 5060
+if rtpp = 0 then rtpp = 5004
+
+
+
+' ip can be numeric ip address or an URL, an integer IP is returned always
+
+if p2p=0 then 
+10
+	' Resolving PBX servers
+	if len(pbx1$) <> 0 then pbxi1 = resolve(pbx1$)
+	if len(pbx2$) <> 0 then pbxi2 = resolve(pbx2$)
+
+	' must be <> 0 !
+	if pbxi1 <> 0 then
+		set_active_pbx(1)
+		syslog "Using PBX1 " + pbx1$ + " --> " + sprintf$("%lA", pbxi1) + ":" + str$(pbxp1)
+	else
+		if pbxi2 <>0 then
+			set_active_pbx(2)
+			syslog "Using PBX2 " + pbx2$ + " --> " + sprintf$("%lA", pbxi2) + ":" + str$(pbxp2)
+		else
+			syslog "Invalid PBX/remote IP or network unreachable, retrying..."
+			delay 10000
+			goto 10
+		endif
+	endif
+	if and(pbxi1<>0,pbxi2<>0) then dual_sip_en=1
+endif
+
+' FIXME - Is it needed?
+if pk_to = 0 then
+	pk_to = 3	' do not allow to be 0
+endif
+
+' locktime cannot be 0
+if lcktm = 0 then
+	'lcktm = 3
+	lcktm = 30	' 30 * 100ms = 3 sec
+endif
+
+if debug then
+	syslog "SIP debug on."
+	syslog "SIP port: " + str$(sipp)
+	syslog "RTP port: " + str$(rtpp)
+endif
+
+
+'[AD 18.04.2008] after registering, contact must be updated with the Contact-Header field
+' of 200 OK (public ip)
+dim ctact$(256)
+
+'SIP default fields: all SIP messages contain these fields
+dim szdef$(300)
+
+'[AD 18.04.2008] szdef$ creation
+gosub 10100
+
+'SIP control port
+open "UDP::" + str$(sipp) as SIP_CONTROL_STREAM
+
+' ***************************************************************************************
+' Start annunfdx-part
+' ***************************************************************************************
+dim inp, vol, again, mgain, bufhi
+
+'receiver audio buffer
+dim _Mr$(1401)	' RTP receive buffer
+dim _Mgw$(1401)	' serial GW buffer
+dim _Mcom$(500) ' Command interface receive buffer
+dim _Ms$(1000)	' Audio send buffer
+dim _Ma$(12)	' empty RTP buffer packet for Exstreamer
+dim com_send_ip$(20)	' command interface remote host
+
+' API temp variables
+dim rl,ri,rmask
+dim rn$(2)
+
+midset _Ma$,1,-2,&H8000
+midset _Ma$,3,2,&H0000
+midset _Ma$,5,4,&H00000000
+midset _Ma$,9,4,&H00000000
+
+open "STP:500" as EEPROM_SETUP_STREAM : read EEPROM_SETUP_STREAM,stp$ : close EEPROM_SETUP_STREAM
+
+vol=midget(stp$,1,1)
+if vol>20 then vol=20
+
+again=midget(stp$,2,1)
+if again>15 then again=15
+
+mgain=midget(stp$,3,1)
+if mgain>127 then mgain=0-and(&HFF,not(mgain-1))	' adjust for 12-19.5 db (values -6 to -1)
+if mgain<-6 then mgain=-6
+if mgain>15 then mgain=15
+
+'input (129=line, 130=mic)
+if midget(stp$,11,1)=129 then
+	inp=1
+else
+	inp=2
+endif
+
+' call on level
+levth=midget(stp$,22,2)			' trigger level for send on level
+calol=midget(stp$,21,1)			' call on level
+if calol=3 then calol=1 else calol=0
+
+' global call timeout (B639)
+gcto=midget(stp$,140,1) * 60000	'convert minutes in ms
+
+'encoding
+dim enc
+enc=midget(stp$,12,1)
+
+' we support only uLaw/aLaw 8kHz for now
+' and G.722 on some devices. G722 support detection done from the webUI scripts
+if and (enc<>7,enc<>9,enc<>12) then
+	syslog "Unsupported encoding "+str$(enc) + " detected, setting to 8 kHz uLaw"
+	enc=7
+endif
+
+'max playback buffer level, if level goes above, drop incoming data
+bufhi=midget(stp$,26,2)
+if debug then syslog "Input audio buffer: " + str$(bufhi)
+
+' device HW type specific actions
+
+if or(htype=HW_ANNUNCICOM_100,htype=HW_IPAM_100,htype=HW_IPAM_102,htype=HW_CARRIER_IPAM_100,&
+      htype=HW_ANNUNCICOM__1000,htype=HW_ANNUNCICOM_200,htype=HW_ANNUNCICOM_PS_16,htype=HW_ANNUNCICOM_155,&
+      htype=HW_ANNUNCICOM_60,htype=HW_ANNUNCICOM_PS1) then
+	open "STP:640" as EEPROM_SETUP_STREAM : read EEPROM_SETUP_STREAM, stp$ : close EEPROM_SETUP_STREAM
+
+	' always take the first two IDs
+	midcpy coi$,1, 31,stp$,1
+	midcpy coi$,33,31,stp$,33
+
+	if or(htype=HW_IPAM_100,htype=HW_IPAM_102,htype=HW_CARRIER_IPAM_100,htype=HW_ANNUNCICOM__1000,htype=HW_ANNUNCICOM_PS_16) then 
+		' Copy the third call ID
+		midcpy coi$,65,31,stp$,65
+	endif
+	if or(htype=HW_ANNUNCICOM__1000,htype=HW_ANNUNCICOM_PS_16) then
+		' copy call IDs 4,5,6,7,8
+		midcpy coi$,97,31,stp$,97
+		midcpy coi$,129,31,stp$,129
+		midcpy coi$,161,31,stp$,161
+		midcpy coi$,193,31,stp$,193
+		midcpy coi$,225,31,stp$,225
+	endif
+	if htype=HW_ANNUNCICOM_PS_16 then
+		' reuse X8 call IDs for keys 9-16:
+		open "STP:1200" as EEPROM_SETUP_STREAM : read EEPROM_SETUP_STREAM, x8num$ : close EEPROM_SETUP_STREAM
+	endif
+endif
+
+'default - enc=7 (uLaw/8kHz)
+if or(htype=HW_EXSTREAMER_100,htype=HW_EXSTREAMER_200,htype=HW_EXSTREAMER_110,htype=HW_EXSTREAMER_120,htype=HW_EXSTREAMER_P5,htype=HW_EXSTREAMER_205) then
+	' disable the encoding flag for Estreamer and IP Speaker
+	' (bit 10 from quality flags)
+	if enc=7 then temp$="11,1,2056"
+	if enc=9 then temp$="11,1,2312"
+	if enc=12 then temp$="11,1,1808"
+else
+	if aec=0 then
+		if enc=7 then temp$="11,1,3080"
+		if enc=9 then temp$="11,1,3336"
+		if enc=12 then temp$="11,1,3856"
+	else
+		' enable AEC
+		if enc=7 then temp$="11,1,11272"
+		if enc=9 then temp$="11,1,11528"
+		if enc=12 then temp$="11,1,12048"
+	endif
+endif
+
+if htype=HW_ANNUNCICOM_155 then	
+	sa155_spk$="Not tested"
+	spk_test_en=0
+	ioctl 101, 0	' disable speaker test at start because it makes noise,
+			' run it from webUI by setting spk_test_en=1 with a
+			' BAS.cgi command when needed
+endif
+
+
+' Calculate 32 bit SSRC
+mac$=sprintf$("%H",0)
+if debug then syslog "Detected MAC Address: "+ mac$
+ssrc = asc2hex(mid$(mac$, 5))
+
+'set audio settings
+'AUD:mode,flags,quality,delay,frame,SSRC"
+aurtp$="AUD:"+temp$+","+str$(bufhi)+",0," + str$(ssrc) 	' take last 32 bits from the MAC address as SSRC
+
+' open AUD for RTP
+gosub 9010
+
+' Switch off the AI Phone at boot
+if aiphone_enable > 0 then
+	' switching AI Phone to off causes acoustic feedback, better put it in listen mode
+	hdx_mode(HDX_MODE_LISTEN)
+endif
+
+
+
+' open the needed handles
+
+'audio (RTP) listen port
+open "UDP:0.0.0.0:"+str$(rtpp) as RTP_STREAM
+
+' UDP control port
+if udpap then open "UDP:0.0.0.0:" + str$(udpap) as UDP_CONTROL_STREAM
+
+' Notification audio port
+if notif_port then  open "UDP:"+notif_addr$+":"+str$(notif_port) as NOTIFY_STREAM
+
+' TCP control port
+if tcpap then open "TCP:0.0.0.0:" + str$(tcpap) as TCP_CONTROL_STREAM
+
+' prepare ringtone
+gosub 32000
+
+' ***************************************************************************************
+' End annunfdx-part
+' ***************************************************************************************
+
+'Session Description
+dim sdp$(350)
+
+gosub 10200
+
+'retx timer (not yet active)
+timer 2, 0
+'phone pickup/hangup and close on timeout timers checkup every 100 ms
+timer 4, 100
+
+'timer for sending NAT keepalives
+dim nattm
+nattm = _TMR_(0)
+
+if p2p then
+	'deactivate the register timer
+	timer 1, 0
+	regto=0
+else
+	'register
+	rREG(0)
+	're-register timer; default re-register time: 100s
+	timer 1, 100*1000
+	regto=100000
+endif
+
+goto 35
+'reregister timer
+30	' always try PBX1 first
+	set_active_pbx(1)
+	' generate a new ID if in a call
+31	if call=4 then  rREG(0) else rREG(1) 	
+	return
+35
+' timers
+on timer1 gosub 30	' reregister timer
+on timer2 gosub 9003	' retx timer
+on timer3 gosub 8002	' audio processing timer
+on timer4 gosub 9005 	' phone pickup/hangup timer
+'enable CGI
+on CGI    gosub 500
+
+' wait for the input level to settle down
+delay 2000
+
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+' Main Loop
+
+100
+
+' PRIORITY: Serial GW
+if serial_api_en >1 then
+	if _TMR_(0) - pser_gw > 50 then
+		pser_gw = _TMR_(0)
+		if mediatype(SERIAL_GW_STREAM) then
+			if serial_api_en > 2 then
+'				' UDP disabled for now
+'				if serial_api_en=2 then
+'				' udp gw
+'				if mediatype(UDP_GW_STREAM) then
+'					udp_gw_len = -lastlen(UDP_GW_STREAM)
+'					if udp_gw_len > 0 then
+'						' Read from UDP handle
+'						if gw_type=GW_TYPE_PASSIVE then 
+'							' check the remote host/port. if 10 seconds has expired
+'							' lock to the new one if needed
+'							tmp_rmt_gw_ip$=rmthost$(UDP_GW_STREAM)
+'							tmp_rmt_gw_port=rmtport(UDP_GW_STREAM)
+'							if udp_gw_init = 0 then
+'								' first UDP connection
+'								rmt_udp_gw_ip$=tmp_rmt_gw_ip$
+'								rmt_udp_gw_port=tmp_rmt_gw_port
+'								last_valid_udp_pkt_tm = _TMR_(0)
+'								syslog "Initial UDP connection from "+rmt_udp_gw_ip$+ ":" + str$(rmt_udp_gw_port)
+'								udp_gw_init = 1
+'							endif
+'							if _TMR_(0) - last_valid_udp_pkt_tm > udp_lock_to then
+'								' lock to the new UDP remote host:port
+'								rmt_udp_gw_ip$=tmp_rmt_gw_ip$
+'								rmt_udp_gw_port=tmp_rmt_gw_port
+'								syslog "Locking to "+rmt_udp_gw_ip$+":" + str$(rmt_udp_gw_port)
+'							endif
+'							read UDP_GW_STREAM, _Mgw$
+'							if and (rmt_udp_gw_ip$ = tmp_rmt_gw_ip$,rmt_udp_gw_port = tmp_rmt_gw_port)  then
+'								' write only from the locked remote host, discard other packets
+'								write SERIAL_GW_STREAM, _Mgw$, udp_gw_len
+'								' was a valid host, update timer
+'								last_valid_udp_pkt_tm = _TMR_(0)
+'							endif
+'						else
+'							' no remote host filtering needed, it is automatically done by the driver
+' 							read UDP_GW_STREAM, _Mgw$
+'							write SERIAL_GW_STREAM, _Mgw$, udp_gw_len
+'						endif
+'
+'					endif
+'					if filesize(SERIAL_GW_STREAM) then
+'						' read from the serial handle
+'						read SERIAL_GW_STREAM, _Mgw$
+'						if gw_type=GW_TYPE_PASSIVE then 
+'							'send to the remote host:port
+'							write UDP_GW_STREAM, _Mgw$, lastlen(SERIAL_GW_STREAM),rmt_udp_gw_ip$,rmt_udp_gw_port
+'						else	
+'							' in active mode, we listen and send to the same port
+'							write UDP_GW_STREAM, _Mgw$, lastlen(SERIAL_GW_STREAM),gw_ip$,udp_gw_port
+'						endif 
+'					endif	
+'				endif
+'			'endif	
+'			else	
+			' passive, or active TCP
+				tcp_gw_len = 0
+				if mediatype (TCP_GW_STREAM) then
+					if connected (TCP_GW_STREAM) then
+						' read data if connected	
+						if filesize (TCP_GW_STREAM) then
+							read TCP_GW_STREAM, _Mgw$
+							tcp_gw_len = lastlen(TCP_GW_STREAM)
+						endif
+					else	
+						' in case of active TCP, try to reconnect
+						if and(serial_api_en=4, _TMR_(0)-tcp_retry_tm > tcp_retry_to) then
+					 		close TCP_GW_STREAM
+							open "TCN:"+gw_ip$+":"+str$(tcp_gw_port) as TCP_GW_STREAM
+							syslog "Trying to reopen active TCP socket: " +gw_ip$ + ":" + str$(tcp_gw_port)
+							tcp_retry_tm=_TMR_(0)
+						endif
+					endif
+				endif
+
+						
+				if mediatype(SERIAL_GW_STREAM) then
+					if tcp_gw_len then write SERIAL_GW_STREAM, _Mgw$, tcp_gw_len
+					ser_gw_len = 0
+					if filesize (SERIAL_GW_STREAM) then 
+						read SERIAL_GW_STREAM, _Mgw$
+						ser_gw_len=lastlen (SERIAL_GW_STREAM)
+					endif
+					if ser_gw_len then 
+						if connected (TCP_GW_STREAM) then 
+							write TCP_GW_STREAM,_Mgw$, ser_gw_len
+						else
+							if debug then syslog "Write to the TCP handle failed, data may be lost!"
+						endif
+					endif
+				endif						
+			endif
+		endif
+	endif
+endif
+
+' PRIORITY : Low
+if _TMR_(0) - plow > 1000 then
+	plow = _TMR_(0)
+	' Get the status for the webUI. For all HW except PS16
+	if htype <> HW_ANNUNCICOM_PS_16 then gosub 32200
+
+	' NAT keepalive timer
+	if nat then
+		if _TMR_(0) - nattm > 20000 then gosub 9002
+	endif
+	'[AD 13.05.2006] Exstreamer check only, end call if not receiving RTP packets for 10s
+'	if htype = 14 then
+'		if and(_TMR_(0)-lsrtp>10000,call=4) then rBYE() : gosub 9006
+'
+'	endif
+endif
+
+' PRIORITY : Medium
+if _TMR_(0)-pmed>200 then
+	pmed = _TMR_(0)
+	' for PS16 get the get the status for the webUI more often to make leds blink
+	if htype=HW_ANNUNCICOM_PS_16 then gosub 32200
+
+	gosub 20500 ' get device I/O state
+	if and(htype<>HW_EXSTREAMER_100,htype<>HW_EXSTREAMER_P5) then	' extreamer has no buttons
+		if aiphone_enable > 0 then 
+			if call=4 then goto 105 			' ignore aiphone button press while call is active
+			if call=5 then goto 105				' or priority message is running
+		endif							' to prevent phantom button press closing the call
+		
+		if ist<>isto then 	' button pressed ?
+			q=xor(ist,isto) : if and(q,ist)=0 then keyin(q)
+			isto=ist
+		endif
+		
+105		if calol=1 then 
+			' call on level works only if audio is opened (only in SIP Monitoring Point mode),
+			' and it may be closed by the end of notification message. So, if in idle state, then 
+			' make sure it is open in this case
+			if and(call=1,mediatype(AUDIO_STREAM)=0) then gosub 9010	
+			gosub 5009 					' check levels, and call if needed ?
+		endif
+	endif
+	if tcpap then ' API TCP messages ?
+		if connected(TCP_CONTROL_STREAM) then
+			l=filesize(TCP_CONTROL_STREAM)
+			if l>0 then
+				apiin=TCP_CONTROL_STREAM
+				read TCP_CONTROL_STREAM,_Mcom$, l
+				cmdin()
+			endif
+		endif
+	endif
+	' API UDP messages
+	if udpap then
+		l = lastlen(UDP_CONTROL_STREAM)
+		if l < 0 then
+			l=-l:apiin=UDP_CONTROL_STREAM
+			com_send_ip$=rmthost$(UDP_CONTROL_STREAM)
+			inprt=rmtport(UDP_CONTROL_STREAM)
+			read UDP_CONTROL_STREAM,_Mcom$,l
+			cmdin()
+		endif
+	endif
+	' API SERIAL port enabled
+	if mediatype(COM_PORT) then
+		l = filesize(COM_PORT)
+		if l then
+			read COM_PORT,_Mcom$,l
+			' command or reply ? If reply, backward tunnel from serial port
+			if xout=CGI_STREAM then goto 102 ' no cgi echo
+			if xout<>0 then ' no serial api support, is a reply
+				q=0 ' divide in chunks if the block is too long
+101				if l>64 then v=64 else v=l
+				l=l-v : stp$="X"
+				for z=1 to v
+					stp$=stp$+sprintf$("%02x",midget(_MCom$,q+z,1))
+				next z
+				q=q+64
+				stp$=stp$+"\r"
+				if xout=UDP_CONTROL_STREAM then
+					write xout,stp$,len(stp$),com_send_ip$,inprt	' write back to UDP
+				else
+					write xout,stp$,len(stp$)
+				endif
+				if l>0 then goto 101
+			else
+				write COM_PORT,_Mcom$+"\n",l  ' echo
+				apiin=COM_PORT
+				if (len(sprt$)+l)<24 then
+					sprt$=sprt$+_Mcom$
+					if midget(_Mcom$,l,1)=&H0d then
+						_Mcom$=sprt$ : cmdin()
+						sprt$=""
+					endif
+				else
+					write COM_PORT,"\r\nMax input reached. Cleaning.\r\n" : sprt$=""
+				endif
+			endif
+		endif
+	endif
+endif
+102
+
+' priority - 300 ms
+' checking for x8 keypress
+if _TMR_(0)-px8_keypress > 300 then
+	px8_keypress = _TMR_(0)
+	if x8 then
+		q=x8get(1)
+		if q>=0 then
+			' valid
+			x8is=q
+			if x8is<>x8iso then
+				' button pressed ?
+				q=xor(x8is,x8iso) : if and(q,x8is)=0 then keyin(shl(q,8))
+				x8iso=x8is
+			endif
+		endif
+	endif
+endif
+
+
+'PRIORITY : High
+if notif_port>0 then
+	if notif_en=0 then
+		' allow to register first
+		if and (p2p=0,sreg<>2) then goto 108
+		if _TMR_(0) - notif_next_tm < 2000 then goto 108	' do not check for 2 seconds if we got RTP stream
+		                                                        ' with unsupported payload
+		notif_len=lastlen(NOTIFY_STREAM)
+		if notif_len < 0 then
+			' Low priority and there is a pending or active call running? Then ignore in the next 2 seconds	
+			if and(notif_prio > 0, or(call=2,call=3,call=4)) then 
+				notif_next_tm=_TMR_(0)
+				syslog "Ignoring low priority message!"
+				goto 107
+			endif
+                  
+                  	notif_party$ = rmthost$(NOTIFY_STREAM)+":"+str$(rmtport(NOTIFY_STREAM))
+                  
+			read NOTIFY_STREAM,_Mr$, -notif_len
+			notif_pload=and(midget(_Mr$,2,1),127)		' check the first 7 bits
+			index = find (notif_pload, payloads)		' FIND if the payload is within our array of supported types
+			if index > -1 then 	
+				notif_en=1				' set it before calling 9006!
+				
+				if bgmen then gosub 32150		' close BGM if active
+				' close properly the call/ring
+				if call=2 then
+					rCAN() 				' cancel outgoing call
+					stop_timer(CLOSE_ON_TIMEOUT_TIMER) 
+				endif
+				if call=3 then 
+					s603() 				' Decline incoming call
+					stop_timer(PICKUP_TIMER)	
+				endif
+
+ 				if call=4 then rBYE() : gosub 9006	' close the active call
+				
+				call=5					' 9006 sets call=1, so fix it to 5 here
+				
+				' modify the remote party string to show where do we get audio from
+				' NB! Must be AFTER the call to 9006!
+				srmt_party$=notif_party$
+			else
+				syslog "Invalid payload found, ignoring payload check in the next 2 seconds ..."
+				notif_next_tm=_TMR_(0) 			' block the check for the next 2 seconds
+			endif
+107		endif
+108	endif
+endif
+
+if lastlen(SIP_CONTROL_STREAM)<0 then gosub 5000 		' SIP packet check, always.
+if cgi_available > 0 then gosub 510	   ' CGI interrupt check, always
+if process_tmr4  > 0 then gosub 9051	' process timer 4 (flag raized from 9005)
+if process_tmr5  > 0 then gosub 9052	' process timer 5 (flag raized from 9005)
+
+
+' check if registration has been successful
+	
+if and(sreg=1,p2p=0) then
+	if _TMR_(0)-reg_start_time > reg_fail_to then
+		' the registration times out, set it to not registered
+		sreg=0
+		' stop resending the REGISTER message
+		timer 2,0
+		
+		if dns_renew>0 then 
+			dns_pending=1	' reg failed, resolve DNS, and try again
+		else
+			if dual_sip_en then 
+				if active_pbx=1 then 
+					set_active_pbx(2) : gosub 31	' simulate REG timer interrupt
+				endif
+			endif
+		endif
+	endif
+endif
+
+ 	on call goto 110,120,130,140,150,160,170
+110
+	if call<>callp then
+		callp=1
+		' Switch off the AI Phone also in idle mode, do it only when entering state 1
+		if aiphone_enable > 0 then hdx_mode(HDX_MODE_LISTEN)
+		' always reset ps_state in idle when PS16 is used
+		' it will be set to 1 on the next pass in state 1,
+		' but we ensure always correct ps16 state start!
+		if htype=HW_ANNUNCICOM_PS_16 then ps_state = 0
+		
+		' switch off the relay on incoming ring if still active
+		if and(rel_on_ring > 0,iostate(rel_on_ring)=1) then ioctl rel_on_ring,0
+		
+
+		if uselink=1 then
+			if debug then syslog "Stopping LINK"
+			dstlnk(0,0)=0
+			dstlnk(0,1)=0
+			uselink=0
+		endif
+
+		' stop the audio timer
+		timer 3, 0
+		' reset the on_hold variable so that next INVITE is sent normal, not as on_hold
+		on_hold=0
+		
+		' in general we restart the BGM when closing call in 9006
+		' but it may happen to be interrupted by notification messaging,
+		' then restart it here as closing the notification message routine
+		' does not call 9006
+		if and (bgmen=0,rebon=0,bgmport) then 
+			gosub 32100
+		else	
+			' make sure the audio does not stay opened
+			if mediatype(RTP_STREAM) then close RTP_STREAM
+			if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+		endif
+		' clear the remote party string (not cleared when notification audio was closed)
+		if bgmen=0 then srmt_party$ = ""
+		' reset the initialing INVITE ID
+		initid$=""
+	endif
+	if dns_pending then			
+		syslog "Resolving "+pbx$
+		i = resolve(pbx$)
+
+		' must be <> 0 !
+		if i<>0 then
+			pbxip$ = sprintf$("%lA", i)
+			syslog "Resolved PBX: " + pbxip$
+			rREG(0)
+		else
+			syslog "DNS failed, will retry the next registration period"
+		endif
+		dns_pending = 0	' we did retry the DNS resolve
+	endif
+		
+
+	goto 100
+120 ' we are calling
+	if call<>callp then
+		callp=2
+		gosub 32000
+		' set the AI Phone to listen mode to hear the ringing
+		if aiphone_enable > 0 then hdx_mode(HDX_MODE_LISTEN)
+	endif
+130 ' incoming call
+	if call<>callp then
+		callp=3
+		gosub 32000
+		' set the AI Phone to listen mode to hear the ringing
+		if aiphone_enable > 0 then hdx_mode(HDX_MODE_LISTEN)
+		' switch on the relay on incoming ring
+		if rel_on_ring > 0 then ioctl rel_on_ring,1 
+	endif
+
+	' play ringtone with 3s silence in between
+	on ringn goto 131,132,133
+	goto 139
+131
+	if bgmen then
+		' stop BGM
+		bgmen=0 : write AUDIO_STREAM,"" : setvol(vol)
+		' open ringtone file
+		gosub 32000
+		if mediatype(RINGING_STREAM)=0 then ringn=0 : goto 139	' do nothing if ring file not found
+	endif
+	ringn=2
+132	' play ring file
+	if filesize(RINGING_STREAM) then
+		read RINGING_STREAM,_Mr$
+		l=lastlen(RINGING_STREAM)
+		if l>0 then ' eof ?
+			write AUDIO_STREAM,_Mr$,l
+		else
+			read AUDIO_STREAM,_Mr$,-6
+			if lastlen(AUDIO_STREAM)<10 then
+				seek RINGING_STREAM,0 : ringn=3 : rt=_TMR_(0) : goto 133
+			endif
+		endif
+	endif
+	goto 139
+133
+	if _TMR_(0)-rt>3000 then ringn=1 : goto 139 	' wait 3 seconds, then ring again
+139
+	if _TMR_(0)-rngto>120000 then 
+		' stop ringing if nobody picks up the phone in 2 minutes
+		if call=2 then rCAN()	' if it was outgoing call, cancel it
+		gosub 9006
+		call=1					' make sure we go in idle mode
+	endif
+	goto 100
+
+140 ' call established
+	if call<>callp then
+		callp=4
+		ringn=0
+		if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+		if mediatype(RTP_STREAM) then close RTP_STREAM 	' : open "UDP:0.0.0.0:"+str$(rtpp) as RTP_STREAM
+		if mediatype(RTP_STREAM)= 0 then open "UDP:0.0.0.0:"+str$(rtpp) as RTP_STREAM
+		
+		gosub 9010 ' reopen audio as per RTP
+
+		if hdxen=0 then
+			if sip_profile <> PROFILE_SIP_GATEWAY then
+				if debug then syslog "Starting call using LINK"
+				uselink=1 ' var, because there can be cases in timer3 where link want be disabled.
+				dstlnk(0,0)=resolve(dstip$)
+				dstlnk(0,1)=dstp
+				link AUDIO_STREAM,RTP_STREAM, dstlnk
+				bufflevel=0
+			endif
+		endif
+
+		if stream_timeout > 0 then
+			' when using stream timeout, mark the call start time
+			' so that we can wait for at least 2 seconds before 
+			' starting checking the stream timeout in 9100
+			call_start_time=_TMR_(0)	
+		endif
+		timer 3, 30 ' start the audio timer
+		' mark also the call start if global call timeout configured
+		if gcto > 0 then gctmr=_TMR_(0)
+	endif
+
+	' readapt the session in case of a reINVITE changes the port and IP
+	if sdp_reinit then
+		'change the port and dest IP
+		dstip$=reinv_dstip$
+		dstp=reinv_dstp
+		
+		if uselink=1 then
+			' in case of using LINK reinit the dest array
+			' if mediatype (RTP_STREAM) then close RTP_STREAM
+			dstlnk(0,1)=dstp
+			dstlnk(0,0)=resolve(dstip$)
+		endif
+		syslog "Adapting RTP session to "+dstip$+":"+str$(dstp)
+		sdp_reinit=0
+	endif
+
+	if clsol then gosub 5012	' if close on level is active, check also for timeout to hangup
+	delay 0
+	if hdxen > 0 then gosub 5014
+	if gcto > 0 then
+		' we gave global call timeout enabled
+		if _TMR_(0) > gctmr + gcto then
+			' global call timer expired, end call
+			rBYE() : gosub 9006
+		endif
+	endif
+
+	goto 100
+
+150 ' getting priority message
+	if call<>callp then
+		callp=5
+		if debug then syslog "Getting priority message ..."
+		' stop the audio timer
+		timer 3, 0
+		if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+		gosub 9040
+		' put the AI_PHONE in listen mode
+		if aiphone_enable > 0 then hdx_mode(HDX_MODE_LISTEN)
+		
+		' enable the relay if needed
+		if and(relay_on > 0,notif_relay>0) then ioctl relay_on,1
+		
+		LINK AUDIO_STREAM,NOTIFY_STREAM, notify_dest
+		notif_pkt_tm=_TMR_(0)
+	endif
+	
+	' check also the stream timeout for notification messaging using the decoded packet
+	' timestamps as using the zero count is not reliable for IPAM-102
+	if mediatype(AUDIO_STREAM) then
+		read AUDIO_STREAM,_Mr$,-21
+		notif_pkt_tm=lastlen(AUDIO_STREAM)
+		if _TMR_(0)-notif_pkt_tm > 1000 then gosub 32170 : call=1 ' we wait for 1000 ms before closing
+	endif
+
+	goto 100
+
+160 ' playing busy tone
+	if callp<>call then 
+		if debug then syslog "Play busy tone"
+		callp=6
+					
+		' on outgoing call, also clear the close on timeout timer
+		if close_on_to then stop_timer(CLOSE_ON_TIMEOUT_TIMER)
+	
+		if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+		if mediatype(RINGING_STREAM)then close RINGING_STREAM
+		open "AUD:11,0,2056,0" as AUDIO_STREAM
+		if mediatype(AUDIO_STREAM)=0 then
+			syslog "Failed to open the audio for the busy tone!"
+			call=1 : goto 100
+		endif
+		open "F_R:busy.wav" as RINGING_STREAM
+		if mediatype(RINGING_STREAM)=0 then
+			syslog "Could not find the busy tone file!"
+			close AUDIO_STREAM
+			call=1  : goto 100
+		endif
+	endif
+	
+	if filesize(RINGING_STREAM) then
+		read RINGING_STREAM,_Mr$
+		l=lastlen(RINGING_STREAM)
+		if l>0 then ' eof ?
+			write AUDIO_STREAM,_Mr$,l
+		else
+			read AUDIO_STREAM,_Mr$,-6
+			if lastlen(AUDIO_STREAM)<10 then 
+				if mediatype(RINGING_STREAM) then close RINGING_STREAM
+				if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+				call=1
+			endif
+		endif
+	endif
+	
+	goto 100
+	
+	
+170 ' playing beep on call answer
+	if callp<>call then 
+		if debug then syslog "Playing  beep tone"
+		callp=7
+		if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+		if mediatype(RINGING_STREAM)then close RINGING_STREAM
+		open "AUD:11,0,2056,0" as AUDIO_STREAM
+		if mediatype(AUDIO_STREAM)=0 then
+			syslog "Failed to open the audio for the beep tone!"
+			' try to open the call anyway without beeping
+			gosub 9008 : goto 100
+		endif
+		open "F_R:beep.wav" as RINGING_STREAM
+		if mediatype(RINGING_STREAM)=0 then
+			syslog "Could not find the beep file!"
+			close AUDIO_STREAM
+			' try to open the call anyway without beeping
+			gosub 9008 : goto 100
+		endif
+	endif
+	
+	if filesize(RINGING_STREAM) then
+		read RINGING_STREAM,_Mr$
+		l=lastlen(RINGING_STREAM)
+		if l>0 then ' eof ?
+			write AUDIO_STREAM,_Mr$,l
+		else
+			read AUDIO_STREAM,_Mr$,-6
+			if lastlen(AUDIO_STREAM)<10 then 
+				if mediatype(RINGING_STREAM) then close RINGING_STREAM
+				if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+				gosub 9008	' start the call now
+			endif
+		endif
+	endif
+	
+	goto 100
+	
+'.........................................................................................
+'CGI
+'.........................................................................................
+500
+	' we raise a flag here that we have received  a CGI command
+	' it will be processed later in the main BCL loop to avoid race conditions
+	cgi_available=1
+	return
+	
+510  ' process the CGI in the BCL loop
+	temp$=_CGI_$
+	_CGI_$=""
+	delay 0
+
+	apiin = CGI_STREAM
+
+	if debug then syslog "Received CGI command : " +  temp$
+
+	l = len(temp$)
+	if l then
+		midcpy _Mcom$,1,l,temp$ : l=l+1
+		midset _Mcom$,l,1,&H0D
+		cmdin()
+	endif
+
+	delay 1		' give some time the last CGI reply to be sent
+	
+	' end the CGI processing, and close the CGI "handle"
+	_CGI_$="*"
+	cgi_available=0
+	return
+
+'.........................................................................................
+' SIP messages
+'.........................................................................................
+
+
+''''''''''''''
+1010		' prepare common SIP header fields
+
+	msg_type$=mid$(smsg$,1,instr(1, smsg$, " ")-1)
+
+	if mid$(msg_type$,1,3) = "SIP" then
+		' in case of OK message, remove the SIP/2.0 header, and take the string after the second space,
+		' for example: SIP/2.0 200 OK ==> we need to fetch the "OK" string
+		if instr(1, smsg$, "200 OK") > 0 then msg_type$="OK"
+		if instr(1, smsg$, "603 ") > 0 then msg_type$="DECLINED"
+		' other specific cases should follow if needed
+	endif
+
+	smsg$=smsg$+"Via: "+via$+nl$
+
+	' if another SIP packet is received before sending OK or DECLINED to the INVITE
+	' the From: and To: fields may be overwritten,and then the SIP server
+	' may ignore the OK+SDP/DECLINED message. So use the From and To fields from the last INVITE
+	if or(and(msg_type$="DECLINED", incall_not_replied > 0),and(msg_type$="OK", ok_inv=1)) then
+		smsg$=smsg$+"From: "+invite_from$+nl$
+		smsg$=smsg$+"To: "+invite_to$+nl$
+		goto 1011
+	endif
+
+	if and(msg_type$="CANCEL", outcall_not_replied > 0) then
+		smsg$=smsg$+"From: "+out_invite_from$+nl$
+		smsg$=smsg$+"To: "+out_invite_to$+nl$
+		goto 1011
+	endif
+	
+	if and(msg_type$="BYE") then
+	        smsg$=smsg$+"From: "+inc_from$+nl$
+	        smsg$=smsg$+"To: "+inc_to$+nl$
+	        goto 1011
+        endif
+	
+	' default case
+	smsg$=smsg$+"From: "+from$+nl$
+	smsg$=smsg$+"To: "+to$+nl$
+
+1011	smsg$=smsg$+"Call-ID: "
+
+	' handle specific cases for Call ID
+	if msg_type$="REGISTER" then smsg$=smsg$+regid$ : goto 1012	' use separate Call ID for registration
+	if msg_type$="BYE" then smsg$=smsg$+incid$	: goto 1012	' the BYE should contain the in call ID
+	if and(msg_type$="OK", ok_inv=1) then
+		' use the INVITE call ID to send OK with SDP
+		smsg$=smsg$+invid$
+		goto 1012
+	endif
+	if and(msg_type$="DECLINED", incall_not_replied > 0) then
+		' use the INVITE call ID to send CANCEL to reject the call
+		smsg$=smsg$+invid$
+		goto 1012
+	endif
+	if and(msg_type$="CANCEL", outcall_not_replied > 0) then
+		' use the sent INVITE call ID to send CANCEL to stop(cancel) the outgoing call
+		smsg$=smsg$+out_invid$
+		goto 1012
+	endif
+
+	smsg$=smsg$+calid$						' "standard" case
+1012	smsg$=smsg$+nl$
+	if and(msg_type$="OK", ok_inv=1) then
+		' take the stored CSeq for the INVITE message we are OK-ing here
+		smsg$=smsg$+"CSeq: "+str$(invite_csqid)+" "+invite_cseqm$+nl$
+		' do not forget to reset the flag, we have no more use of it
+		ok_inv=0
+		goto 1013
+	endif
+	if and(msg_type$="DECLINED", incall_not_replied > 0) then
+		' take the stored CSeq for the INVITE message we are CANCEL-ing here
+		smsg$=smsg$+"CSeq: "+str$(invite_csqid)+" "+invite_cseqm$+nl$
+		' do not forget to reset the flag, we have no more use of it
+		incall_not_replied=0
+		goto 1013
+	endif
+
+	' default case
+	smsg$=smsg$+"CSeq: "+str$(csqid)+" "+cseqm$+nl$
+
+1013	return
+
+''''''''''''''
+1020		' prepare common SIP header for status and response messages
+	gosub 1010
+	if rrout$<>"" then
+		smsg$=smsg$+"Record-Route: "
+		smsg$=smsg$+rrout$+nl$
+	endif
+
+	return
+
+''''''''''''''
+1030		' prepare Via field for transactions
+	' generate new branch
+	if meth$="ACK" then
+		if req$="200" then gosub 5010
+	else
+		If meth$<>"CANCEL" then gosub 5010
+	endif
+	via$ = protv$ + "/UDP " + ip$ + ":" + str$(sipp) + &
+				";branch=z9hG4bK" + sprintf$("%08lx",brnch)
+	gosub 1010
+
+	return
+
+
+''''''''''''''
+1100		' send 180 Ringing
+'.........................................................................................
+
+	smsg$=protv$+" 180 Ringing"+nl$
+	gosub 1020
+	smsg$=smsg$+szdef$
+	smsg$=smsg$+"Content-Length: 0"+nl$+nl$
+	gosub 9001
+
+	s180=0
+	return
+
+
+''''''''''''''
+1140		' send 200 OK
+	local sdp_on
+	' sdp_on=1 ==> send OK with SDP (only when we send OK in reply to INVITE).
+
+	smsg$=protv$+" 200 OK"+nl$
+	if sdp_on > 0 then ok_inv=1	' set the flag so the routine 1010 should know to use INVITE call ID
+	gosub 1020
+	smsg$=smsg$+szdef$
+
+	if sdp_on > 0 then
+		smsg$=smsg$+sdp$
+	else
+		smsg$=smsg$+nl$
+	endif
+
+	'in P2P we always send 200 OK direct
+	if p2p>0 then
+		gosub 9020
+	else
+		' BYE must sent only if a dialog is estabilished, so we must bypass the proxy routing
+		' (RFC 3261 page 12 fig. 1)
+		if and(call=4,cseqm$="BYE") then
+			gosub 9020
+		else
+			gosub 9001
+		endif
+	endif
+	s200=0
+	return
+
+''''''''''''''
+1150	' send 202 Accepted (for sent REFER)
+        ' To be implemented. Current implementation works only
+		' via the SIP server, which takes care of that
+	return
+	
+''''''''''''''
+1300		' send 603 Declined
+
+	smsg$=protv$+" 603 Declined"+nl$
+	gosub 1020
+	smsg$=smsg$+szdef$+nl$
+	if p2p > 0 then gosub 9020 else gosub 9001
+	s603=0
+	return
+	
+''''''''''''''
+1350		' send 481 Call Leg/Transaction Does Not Exist
+
+	smsg$=protv$+" 481 Call Leg/Transaction Does Not Exist"+nl$
+	gosub 1020
+	smsg$=smsg$+szdef$+nl$
+	if p2p > 0 then gosub 9020 else gosub 9001
+	s481=0
+	return
+	
+''''''''''''''
+1400		' send 486 Busy Here
+
+	smsg$=protv$+" 486 Busy Here"+nl$
+	gosub 1020
+	smsg$=smsg$+szdef$+nl$
+	if p2p > 0 then gosub 9020 else gosub 9001
+	s486=0
+	return
+
+''''''''''''''
+1500		' REGISTER, only register if not in a call setup
+	LOCAL rereg
+	syslog "Registering in state:"+str$(call)
+	' registering during a call setup (call=2 or 3) may cause a BYE from the server
+	if or(call=1,call=4,call=5) then
+		if or(sreg = 0, sreg = 2) then	' not registered? Set registration pending
+		 						' already registered? so we do reregistration now
+			sreg = 1				' set that registration is pending
+			reg_start_time=_TMR_(0)
+		endif
+		
+		getip=1 '[AD 23.04.2008] extract ip needed
+		meth$="REGISTER" : csqnd=csqnd+1
+		smsg$=meth$+" sip:"+pbx$+" "+protv$+nl$
+		smsg$=smsg$+"Max-Forwards: 70"+nl$
+		from$="<sip:"+user$+"@"+pbx$+">;tag="+tag$
+		to$="<sip:"+user$+"@"+pbx$+">"
+		if rereg=0 then regid$=str$(random())+"@"+ip$
+		csqid=csqnd : cseqm$=meth$
+		gosub 1030
+		smsg$=smsg$+"Expires: "
+		' clean bindings if device is resetting
+		if csqnd=0 then smsg$=smsg$+"0" else smsg$=smsg$+str$(reg_time)
+		smsg$=smsg$+nl$
+		smsg$=smsg$+ctact$
+		smsg$=smsg$+nl$
+		smsg$=smsg$+"User-Agent: Barix"+nl$
+		if auth then
+			if auth=2 then smsg$ = smsg$ + "Proxy-" + auth$ else smsg$ = smsg$ + auth$
+		endif
+		smsg$=smsg$+"Content-Length: 0" + nl$
+		smsg$=smsg$+nl$
+
+		gosub 9001 'send
+		if auth then auth=0 : auth$="" 	' if we registered with authentication, next REG request
+						' should be without auth unless getting the challenge
+	else
+		'try again in 3s
+		timer 1, 3000
+		regto=3000
+	endif
+
+	rREG = 0
+	return
+
+
+''''''''''''''
+1510		' send INVITE
+	' if we want just to place the call on hold, we do not need a new dialog
+	' just reuse the current one and send INVITE with a=sendonly in the SDP
+	' to put the remote party on hold
+	
+	if on_hold=0 then
+		csqd=csqd+1 : incm=0 ' setting up a new call, resetting dialog variables
+		bpuri$="" ' resetting bypass fields for new dialog
+	else
+		'if csqd=0 then csqd=1	' if this is our first INVITE
+		csqd=csqd+1
+		bpuri$=""	
+	endif
+	
+	' send invite
+	if on_hold=0 then 
+		if debug then syslog "Inviting :"+uas$ 
+	else 
+		' uas$ is empty, fill it with the ID 
+		' of the current remote party in the call
+		' remove the HTML escape characters for "<" and ">"
+		
+		start_bracket=INSTR(1,srmt_party$,"sip:")
+		close_bracket=INSTR(1,srmt_party$,"#62;")
+		
+		' and grab just the valid sip url 
+		if and(start_bracket>0,close_bracket>0) then
+			uas$=MID$(srmt_party$,start_bracket+4,close_bracket-start_bracket-5)
+		endif
+					
+		if debug then syslog "Placing "+uas$+" on hold"
+	endif
+	
+	meth$="INVITE"
+	out_invite_to$="<sip:"+uas$+">"
+	if len(sip_display_id$) > 0 then 
+		out_invite_from$=sip_display_id$+" "
+	else	
+		out_invite_from$=""
+	endif
+	if p2p=0 then
+		' SIP server mode
+		out_invite_from$=out_invite_from$+"<sip:"+user$+"@"+pbx$+ ">;tag="+tag$
+		smsg$=meth$+" sip:"+uas$+" "+protv$+nl$+ &
+	       "Via: "+protv$+"/UDP "+ip$+":"+str$(sipp)+ &
+	       ";branch=z9hG4bK"+sprintf$("%08lx",brnch)+nl$
+	    if on_hold=1 then
+			' send in-dialog invite with the current From and To fields
+			smsg$=smsg$+&
+			"From: "+from$+nl$+ &
+		    "To: "+to$+nl$
+		else	
+			' create a new invite
+			smsg$=smsg$+&
+	       	"From: "+out_invite_from$ + nl$+ &
+	      		"To: "+out_invite_to$+nl$
+		endif
+	       
+	    smsg$=smsg$+&
+	    	"CSeq: "+str$(csqd)+" "+meth$+nl$+ &
+	    	szdef$
+	else
+		' P2P mode, send own IP and port number as local URI
+		' so that the FROM field is like that:
+		' FROM: <sip:192.168.xxx.xxx:5060
+		' ASI,07.06.2012
+		' It is more compliant to have also the ID as in SIP mode,
+		' so modified to be FROM: <sip:ID@192.168.xxx.xxx:5060
+		out_invite_from$=out_invite_from$+"<sip:"+user$+"@"+ip$+">;tag="+tag$
+		smsg$=meth$+" sip:"+uas$+" "+protv$+nl$+ &
+	       "Via: "+protv$+"/UDP "+ip$+":"+str$(sipp)+ &
+	       ";branch=z9hG4bK"+sprintf$("%08lx",brnch)+nl$ + &
+	       "From: "+out_invite_from$+nl$+ &
+	       "To: "+out_invite_to$+nl$+ &
+	       "CSeq: "+str$(csqd)+" "+meth$+nl$+ &
+	       szdef$
+	endif
+	srmt_party$=uas$
+	if auth then
+		smsg$=smsg$+ &
+		"Call-ID: "+lstid$+nl$
+		out_invid$=lstid$
+		' Auth or proxy auth
+		if auth=2 then
+			smsg$=smsg$+"Proxy-"+auth$
+		else
+			smsg$=smsg$+auth$
+		endif
+		'send next message without auth
+		auth=0
+	else
+		if on_hold=0 then
+			' generate a new call ID
+			out_invid$=str$(random())+"@"+ip$
+			smsg$=smsg$+"Call-ID: "+out_invid$+nl$
+		else
+			' the INVITE (hold) must be sent with the current (in call ) ID
+			smsg$=smsg$+"Call-ID: "+incid$+nl$
+		endif
+	endif
+	smsg$=smsg$+sdp$
+
+	if on_hold=0 then outcall_not_replied=1		' for on_hold=1 we do not treat it as outgoing call invite
+	
+	gosub 9001
+
+	rINV=0
+	return
+
+''''''''''''''
+1520		' send ACK
+	LOCAL dirct
+
+	rmuri$=lsuri$ ' generally, uri is the one of last message sent, but..
+
+	'in response to a 200 OK ...
+	if req$="200" then
+		'[AD 20.06.2008] RFC 3261 page 11, if a Contact header was present in 200 OK, the ack
+		' must be sent directly (talking about URI) to the contact uri (see RFC 3261 page 12
+		' fig. 1).
+		if bpuri$ then rmuri$=bpuri$
+	endif
+
+	meth$="ACK"
+	smsg$=meth$+" "+rmuri$+" "+protv$+nl$ : cseqm$=meth$
+	gosub 1030
+	if auth$<>"" then smsg$=smsg$+"Proxy-"+auth$
+	if rrout$<>"" then
+		dirct=0
+		smsg$=smsg$+"Route: "+rrout$+nl$
+	else
+		' no record-route in the 200 OK, ACK must be sent directly (as IP)
+		dirct=1
+	endif
+	smsg$=smsg$+"Max-Forwards: 70"+nl$
+	smsg$=smsg$+"Content-Length: 0"+nl$+nl$
+
+	if and(req$="200",dirct=1) then
+		gosub 9020 'send direct
+	else
+		gosub 9001
+	endif
+
+	rACK=0
+	return
+
+
+''''''''''''''
+1530		' send BYE
+	' OPTIONS, REGISTER and NOTIFY SIP messages may change the dialog
+	' From and To fields theus causing the BYE message later to fail 
+	' with message 486 Call leg does not exist. So use the incall stored values:
+	if incm=1 then temp$=inc_to$:inc_to$=inc_from$:inc_from$=temp$
+	
+	meth$="BYE" : csqd=csqd+1 : csqid=csqd
+	if bpuri$ then rmuri$=bpuri$ else rmuri$=lsuri$
+	smsg$=meth$+" "+rmuri$+" "+protv$+nl$ : cseqm$=meth$
+	gosub 1030
+	
+	' if using multiple proxy relays, fetch the last one in the chain,
+	' and create the proper Route field
+	if rrout$<>"" then 
+		route_ip$=""
+		route_i=0
+		route_x=instr(route_i+1,rrout$,",")
+		if route_x=0 then
+			smsg$=smsg$+"Route: "+rrout$+nl$
+			sub_rrout$=rrout$
+		else
+1535			if route_x>route_i then
+				sub_rrout$=mid$(rrout$,route_i+1,route_x-route_i-1)
+				smsg$=smsg$+"Route: "+sub_rrout$+nl$
+				route_i=route_x
+				route_x=instr(route_i+1,rrout$,",")
+				goto 1535
+			else
+				sub_rrout$=mid$(rrout$,route_i+1)
+				smsg$=smsg$+"Route: "+sub_rrout$+nl$
+			endif
+		endif
+		'try to findout the last route IP
+		route_i=0
+		route_x=instr(route_i+1,sub_rrout$,"sip:")
+		if route_x>0 then 
+			route_i=route_x+4
+			' check if we have additional, params after the IP (separated with ";")
+			route_x=instr(route_i,sub_rrout$,";")
+			if route_x > route_i then 
+				route_ip$=mid$(sub_rrout$,route_i,route_x-route_i)
+			else	
+				'no params, get the end
+				route_x=instr(route_i,sub_rrout$,">")
+				if route_x > route_i then route_ip$=mid$(sub_rrout$,route_i,route_x-route_i)
+			endif
+		endif
+	endif
+	
+	smsg$=smsg$+ctact$+nl$
+	smsg$=smsg$+"Max-Forwards: 70"+nl$
+	smsg$=smsg$+"Content-Length: 0"+nl$+nl$
+	gosub 9020 'send direct
+	on_hold=0
+	route_ip$=""
+	rBYE=0
+	return
+
+
+''''''''''''''
+1540		' send CANCEL
+	meth$="CANCEL"
+	': csqd=csqd+1 : ' CANCEL should use the dialog ID it is cancelling
+	csqid=csqd
+	if bpuri$ then rmuri$=bpuri$ else rmuri$=lsuri$
+	smsg$=meth$+" "+rmuri$+" "+protv$+nl$ : cseqm$=meth$
+	gosub 1030
+	smsg$=smsg$+ctact$+nl$
+	if rrout$<>"" then
+		smsg$=smsg$+"Record-Route: "+rrout$+nl$
+	endif
+	smsg$=smsg$+"Max-Forwards: 70"+nl$
+	smsg$=smsg$+"Content-Length: 0"+nl$+nl$
+	'send trough proxy
+	gosub 9001
+	rCAN=0
+	return
+
+''''''''''''''	
+1550	' send REFER
+
+	if debug then syslog "Refering to :"+uas$
+	
+	meth$="REFER"
+
+	refer_from$="<sip:"+user$+"@"+pbx$+ ">;tag="+tag$
+	smsg$=meth$+" sip:"+srmt_party$+" "+protv$+nl$+ &
+	     	"Via: "+protv$+"/UDP "+ip$+":"+str$(sipp)+ &
+	       	";branch=z9hG4bK"+sprintf$("%08lx",brnch)+nl$ + &
+		"From: "+from$ + nl$+ &
+	      	"To: "+to$+nl$+ &
+	       	"CSeq: "+str$(csqid+1)+" "+meth$+nl$
+		
+	smsg$=smsg$+ &
+		"Call-ID: "+incid$+nl$+ &
+		"Refer-To: sip:"+uas$+nl$+ &
+		"Referred-By: sip:"+user$+"@"+pbx$+nl$+ &
+		ctact$+nl$+&
+		"Content-Length: 0"+nl$+nl$
+
+	gosub 9001
+	
+	if on_hold>0 then 
+		on_hold=0 	' On Hold processing finished
+		gosub 10200	' restore the SDP without "a=recvonly"
+	endif
+	
+	rREF=0
+	return
+
+4200
+        ' change aiphone mode
+	' 0 - audio off
+	' 1 - output (talk)
+	' 2 - input (listen)
+	' also mutes and unmutes the speaker in HDX mode
+	' without AI_Phone enabled
+	local mode_number
+	
+	if mediatype(AUDIO_STREAM)=0 then return	' nothing to do if audio is closed
+
+	if aiphone_enable=0 then 
+		if hdx_state=mode_number then
+			' do nothing if we are already in this state
+			return
+		else	
+			' update the state and do the switching
+			hdx_state=mode_number
+		endif
+		' do the same trick "muting" with balance in HDX also when not using AI_Phone
+		if hdx_state = HDX_MODE_TALK then  
+			if debug then syslog "TALK Mode: Muting speaker!"
+			SEEK AUDIO_STREAM,0	' flush encoding buffer
+			write AUDIO_STREAM,"10",-8 ' "mute spk"
+			if inp=2 then write AUDIO_STREAM,"1",-14 ' unmute mic
+		endif
+		if hdx_state = HDX_MODE_LISTEN then  
+			if debug then syslog "LISTEN Mode: Unmuting speaker!"
+			write AUDIO_STREAM,"0",-8 ' "unmute spk"
+			if inp=2 then write AUDIO_STREAM,"0",-14 ' mute mic
+		endif
+		return
+	endif
+
+	' we have AI_Phone enabled, do more here ...
+	hdx_state=mode_number
+	if mode_number=aiphone_state then return 	' no need to switch if we are already ion this mode
+	
+	on mode_number+1 goto 4210,4220,4230
+
+	if debug then syslog "Error: Invalid AI_Phone state "+ str$(mode_number+1) + " requested!"
+	return				' do nothing if invalid mode is requested
+
+4210    ' Audio OFF
+	' do not use the OFF state in idle, set it to DECODING
+	' instead to avoid the accoustic feedback.
+	' FIXME: This may not be needed for AI_Phone stations
+	' using the speaker as microphone! Add a web UI configuration
+	' item about the AI_Phone type
+
+	write AUDIO_STREAM,"0",-17
+	aiphone_state=0
+	if debug then syslog "AI Phone switched off"
+	goto 4240
+
+4220    ' Talk mode (mic ON, spk OFF)
+        ' NB (aiphone "speaker" is not completely muted! Do that manually
+        ' by setting the balance ro right (10). Setting volume takes 200ms!)
+	' new encoding switching sequence (to run properly with IPAM 102)
+	write AUDIO_STREAM,"0",-17	' switch off amplifier
+	write AUDIO_STREAM,"10",-8	' mute also the aiphone speaker using balance setting to 10 (right)
+	write AUDIO_STREAM,"1",-17	' switch amplifier to encoding
+	write AUDIO_STREAM,"",0		' flush output buffer (app+cpu)
+	delay 10			' wait sometime the DC energy from the switching to dissipate
+	SEEK AUDIO_STREAM, 0		' flush also input buffer
+
+	aiphone_state=1
+	if debug then syslog "AI Phone set to talk mode"
+	goto 4240
+4230
+	' decoding (mic OFF, spk ON)
+	write AUDIO_STREAM,"2",-17
+	'"unmute" the speaker (set balance to 0)
+	write AUDIO_STREAM,"0",-8
+
+	aiphone_state=2
+	if debug then syslog "AI Phone set to listen mode"
+4240
+	return
+
+
+'---------------------------------------------------------------------------------------------
+'SIP handler
+' WARNING : see RFC3261, page 12 fig 1
+' ACK and BYE can be sent directly to the rmote peer, bypassing routing
+'---------------------------------------------------------------------------------------------
+5000	rmtip$=rmthost$(SIP_CONTROL_STREAM)
+5011	read SIP_CONTROL_STREAM, smsg$, 0 			' read message
+	if smsg$="\r\n\r\n" then goto 5011			' ignore the additional CR+LF sent by some Siemens SIP phones
+	if len(smsg$) = 0 then return 				' keepalive messages don't need to be processed
+
+	' postpone registration with 3 seconds so that it does not occur while processing this message
+	if and (p2p=0,regto > 0, regto - _TMR_(1) < 1000) then 	' If we have less than a second before reREG
+	  	regto = 5000					' then delay it (2000 remaining + 3000 extra)
+		TIMER 1, regto					' NB! If we get message every 2 seconds, we may
+		syslog "REG timer extended with 3 seconds"	' never register again! Add a max delay retries!
+	endif
+
+	gosub 9009 : if debug then syslog dbgrx$ + req$		' get request type
+	
+	if and(refer_en=0,req$="REFER") then return		' ignore the REFER message if not allowed 
+	
+	if req$="INVITE" then
+		'ignore P2P calls in SIP mode
+		if p2p=0 then
+			if rmtip$ <> pbxip$ then 
+				syslog "Direct IP calls in SIP mode not supported!"
+				return
+			endif
+		endif
+	endif
+	gosub 9004 						' extract SIP fields
+	timer 2,0 : retx = 0 					' reset retx timer
+
+	'process pressed key
+	if req$ = "INFO" then
+		' process SIP INFO only if we are in a call
+		if call=4 then
+			s200(0)
+			if infid < csqid then gosub 8000 : infid = csqid
+		else
+			s481()
+		endif
+		return
+	endif
+
+	if req$="INVITE" then
+	
+		' do not set remote party ID when high priority stream is running
+		' or the device is not callable
+		' the INVITE will be declined anyway
+		if and(notif_en>0, notif_prio=0) then goto 5111
+		if pkmod=3 then goto 5111
+		
+		
+		' do not set the remote party id also if we are in a call, 
+		' and we get an INVITE from other party (different call ID)
+		' as we will most probably cancel it in 5001, and it will wrongly
+		' overwrite the remote party id
+		' on the other hand, we want to allow in call reinvites in the future
+		' so, allow INVITES with the same call id only
+		if and(call=4,calid$<>incid$) then goto 5111
+		
+		' remove the trailing tag from the FROM field,
+		' and use it as remote party string
+		
+		srmt_party$=MID$(from$,1,INSTR(1,from$,";tag")-1)	' extract it
+		
+		' Also have in mind that the FROM field may contain quotes, which will cause the 
+		' browser not to display it correctly, so we need to escape them
+
+		start_bracket=INSTR(1,srmt_party$,"<")
+		close_bracket=INSTR(1,srmt_party$,">")
+		
+		if and(start_bracket>0,close_bracket>0) then
+			srmt_party$=MID$(srmt_party$,1,start_bracket-1)+"&#60;"+MID$(srmt_party$,start_bracket+1, close_bracket-start_bracket-1)+"&#62;"
+		endif
+
+5111		' store the CallID of the Invite message so that we can correctly send OK/CANCEL to it if we get another
+		' SIP message (and another CallID) while ringing
+		invid$=calid$
+		incall_not_replied=1
+		gosub 5001 : return
+	endif
+	
+	if req$="REFER" then
+		syslog "Usage of the REFER method is limited only for use in blind transfer via SIP proxy."
+		syslog "Use of REFER in P2P mode is to be implemented!"
+		return
+	endif
+	if req$="200" then : gosub 5002 : return
+	if req$="202" then 
+		' reply to sent REFER? Then close the call
+		if debug then syslog "202 Accepted received - closing the call ..." 
+		rBYE() : gosub 9006 
+		return	
+	endif
+	if or(req$="401",req$="407") then gosub 5003 : return
+	if or(req$="BYE",req$="CANCEL") then gosub 9006 : s200(0) : return
+	if or(req$="NOTIFY",req$="OPTIONS") then s200(0) : return
+	if or(req$="486",req$="603") then  gosub 9006 : rACK() : call=6 : return ' play busy tone
+
+	'process unhandled 4xx, 5xx or 6xx
+	if or(instr(1,req$,"4"),instr(1,req$,"5"),instr(1,req$,"6")) then
+		if req$="503" then
+			if meth$="REGISTER" then
+				' we may want to do a DNS resolving in case we get 503 for REGISTER
+				if dns_renew then 
+					dns_pending=1
+				else
+					' now sequence count is cleared (see expires=0 on first 2 CSeq)
+					' reregister on 2 seconds
+					timer 1, 2000
+					regto=2000
+					' try the backup PBX server if configured
+					if dual_sip_en then set_active_pbx(2)
+				endif
+			endif
+		endif
+		gosub 9006 : rACK() : return
+	endif
+	if req$ = "403" then 'process 403 forbidden
+		if auth_id$ <> "" then
+			syslog "Auth. failed " + &
+				 "(user: \"" + auth_id$ + "\") - verify your settings."
+		else
+			syslog "Auth. failed " + &
+				 "(user: \"" + user$ + "\") - verify your settings."
+		endif
+		end
+	endif
+
+	return
+
+'handle INVITE
+5001
+	' remember the From. To fields and CSeq
+	invite_from$=from$
+	invite_to$=to$
+	invite_cseqm$=cseqm$
+	invite_csqid=csqid
+
+	if pkmod=3 then 
+		if p2p then gosub 10050
+		s603() 
+		return 'not callable
+	endif
+	if and(notif_en>0, notif_prio=0) then 
+		if p2p then gosub 10050 
+		s603()
+		return 'reject calls when high priority notification message is active
+	endif
+	
+	if call=5 then gosub 32170 : call=1	' close notification messaging.	It also sets call=1 so that the call 
+						' can be properly handled according the pkmod
+
+	if call=1 then	
+		incm=1 				'incoming call flag
+		if pkmod=0 then 		' pick up
+			gosub 10050 		' capture bypass url for direct messaging [RFC 3621 page 12, fig 1]
+			s200(1) 
+			if bgmen then gosub 32150	' Stop the BGM if playing
+			gosub 9011		' answer with beep
+			initid$=invid$
+		endif
+				
+		if or(pkmod=1,pkmod=2) then
+			call=3
+			gosub 10050 		' capture bypass url for direct messaging [RFC 3621 page 12, fig 1]
+			gosub 9007 		' start local ringing
+			s180() 			' send ringing
+			if debug then
+				if pkmod=1 then
+					syslog "Auto answer in " + str$(pk_to/1000) + " secs..."
+				else
+					syslog "Auto hang-up in " + str$(pk_to/1000) + " secs..."
+				endif
+			endif
+			'timer 4, pktm*1000
+			reset_timer(PICKUP_TIMER)
+			initid$=invid$
+		endif
+		return
+	endif
+	
+	if call=2 then s486() : return			' cancel incoming calls also when we are dialing out
+	
+	if call=3 then 
+		if incm=1 then
+			' if we are ringig because of incoming call, then check the INVITE
+			if initid$=invid$ then
+				' this is the same invite that has initiated the call, send ring indication
+				s180()
+			else
+				' "alien invite", reject call
+				if p2p >0 then 
+					p2pbpip$=bpip$ : p2pbpp=bpp		' store the current bypass URI
+					gosub 10050					    ' get the IP for direct answer in P2P
+					s486()
+					bpip$=p2pbpip$ : bpp=p2pbpp		' restore the bypass URI
+				else
+					s486() 
+				endif
+			endif
+		else
+			' we are dialing out, reject the incoming call
+			s486()
+		endif
+		return
+	endif
+	
+	if call=4 then 
+		if incid$=invid$ then 
+			' Handle re-INVITEs. for now just ignore them (send an OK with SDP). 
+			' However, in the future, we need to do it properly (really change the RTP session)
+			' FIXME: For now we just compare the call ID of the current INVITE and the
+			' the one used in the call dialog, but other params (From, To, Version)
+			' also need to be compared for complete match
+
+			' readapt the session
+			reinv_dstip$=tmp_dstip$
+			reinv_dstp=tmp_dstp
+			sdp_reinit=1
+			s200(1)
+		else
+			' "alien invite", reject call
+			if p2p >0 then 
+				p2pbpip$=bpip$ : p2pbpp=bpp		' store the current bypass URI
+				gosub 10050					' get the IP for direct answer in P2P
+				s486()
+				bpip$=p2pbpip$ : bpp=p2pbpp		' restore the bypass URI
+			else
+				s486() 					' cancel all requests if already in a call
+			endif
+		endif
+	endif
+
+	return
+
+'handle OK
+5002
+	'reset authentication retries
+	authr=0
+	'[AD 23.04.2008] we SHOULD get the our public ip from "received" in the Via field,
+	' to use it in sdp for direct audio communication, and we MUST detect the Contact
+	' header field to reply with ack bypassing the proxy routing.
+	gosub 10000
+
+	'accepted invite? accept and ack
+	if cseqm$="INVITE" then
+		if on_hold>0 then 
+			' check for INVITE (hold) OK
+			if instr (1,smsg$,"a=recvonly") then
+				' do not open a call, just ACK it 
+				rACK()
+				' prepare and send the REFER Message
+				uas$=transfer_to$ : gosub 9030 
+				delay 2000 : rREF()	
+			endif
+		else
+			' check if the To field we have generated at INVITE has
+			' been modified by adding a tag
+			if to$<>out_invite_to$ then
+				' if the generated To: is contained in the received To:
+				if instr(1,to$,out_invite_to$) then 
+					' replace it with the one received from the OK message
+					out_invite_to$=to$
+				endif
+			endif
+			gosub 9011	' answer with beep
+			rACK()
+		endif
+	else
+		' set that we have registered
+		if cseqm$="REGISTER" then sreg = 2 : dns_pending=0
+	endif
+	return
+
+' send re-INVITE or re-REGISTER
+5003
+	're-register with auth
+	if cseqm$="REGISTER" then
+		if authr>10 then
+			if auth_id$ <> "" then
+				syslog "Too many unsuccessful auth tries (username: \"" + auth_id$ + "\")"
+			else
+				syslog "Too many unsuccessful auth tries (username: \"" + user$ + "\")"
+			endif
+			syslog "Please check both device and PBX configuration."
+			sreg = 0
+		else
+			rREG(1)
+		endif
+	endif
+	if cseqm$="INVITE" then
+		if authr>10 then
+			syslog "Invite failed, destination unavailable."
+		else
+			rACK() ' re-reinvite with auth
+			rINV()
+		endif
+	endif
+	authr=authr+1 'increase authentication tries
+
+	return
+
+'''''''''
+' keyin : button press handler
+5004
+	LOCAL ival
+	
+	if and(call=2,close_on_to > 0) then return			' ignore second button press once call initiated (door station)
+	if aiphone_enable > 0 then
+		if and(call=1,_TMR_(0)-aiphone_tm < 5000) then return	' ignore the button press for 5 seconds
+	                                                       		' after the call to avoid initiating next call
+									' due to a phantom button press
+	endif
+
+	keyin=0
+	'if pressed while nobody is calling: get number, geneupdate.html rate new branch id and send invite
+	'if pressed while we are getting low priority message, treat it as above
+	if or(call=1, and(call=5,notif_prio=1)) then
+		if ival>255 then
+			ival=shr(ival,8)
+			'syslog "X8 ival="+str$(ival)
+			' X8 button
+			if ival=1 then dial$=mid$(x8num$,1,31) : ps16_key=9 : call_start_button=9
+			if ival=2 then dial$=mid$(x8num$,33,31) : ps16_key=10 : call_start_button=10
+			if ival=4 then dial$=mid$(x8num$,65,31) : ps16_key=11 : call_start_button=11
+			if ival=8 then dial$=mid$(x8num$,97,31) : ps16_key=12 : call_start_button=12
+			if ival=16 then dial$=mid$(x8num$,129,31) : ps16_key=13 : call_start_button=13
+			if ival=32 then dial$=mid$(x8num$,161,31) : ps16_key=14 : call_start_button=14
+			if ival=64 then dial$=mid$(x8num$,193,31) : ps16_key=15 : call_start_button=15
+			if ival=128 then dial$=mid$(x8num$,225,31) : ps16_key=16 : call_start_button=16
+		else
+			if ival=1 then dial$=mid$(coi$,1,31) : ps16_key=1 : call_start_button=1
+			if ival=2 then dial$=mid$(coi$,33,31) : ps16_key=2 : call_start_button=2
+			if ival=4 then dial$=mid$(coi$,65,31) : ps16_key=3 : call_start_button=3
+			if ival=8 then dial$=mid$(coi$,97,31) : ps16_key=4 : call_start_button=4
+			if ival=16 then dial$=mid$(coi$,129,31) : ps16_key=5 : call_start_button=5
+			if ival=32 then dial$=mid$(coi$,161,31) : ps16_key=6 : call_start_button=6
+			if ival=64 then dial$=mid$(coi$,193,31) : ps16_key=7 : call_start_button=7
+			if ival=128 then dial$=mid$(coi$,225,31) : ps16_key=8 : call_start_button=8
+		endif
+
+		if or(p2p,dial$<>"") then
+			uas$=dial$
+			gosub 5100
+		endif
+		return
+	endif
+	'if pressed while we are calling: abort call
+	if call=2 then rCAN() : call=1 : return
+	
+	'if pressed while ringing: disable hangup timer, send ok and set up call
+	if call=3 then
+		' if it is pkmod 1,2 and the call is incoming, clear the pickup timer
+		if incm>0 then
+			if or(pkmod=1,pkmod=2) then stop_timer(PICKUP_TIMER)
+		else
+			' on outgoing call, also clear the close on timeout timer
+			if close_on_to then stop_timer(CLOSE_ON_TIMEOUT_TIMER)
+		endif
+		s200(1) : gosub 9011
+		return
+	endif
+	
+	'if pressed while in a call: must hang up
+	if call=4 then 
+		if and(refer_en>0,refer_button>0) then
+			if ival>255 then 
+				ival=shr(ival,8) : x8_button=1 
+			else 
+				x8_button=0
+			endif
+			if and(ival, shl(1,(call_start_button-x8_button*8)-1))=1 then
+				' we have pressed the same button, close the call
+				rBYE() : gosub 9006 : return
+			else
+				' Transfer  the call to that number 
+				' find the pressed button first
+				if x8_button=0 then
+					if ival=1 then transfer_to$=mid$(coi$,1,31)
+					if ival=2 then transfer_to$=mid$(coi$,33,31) 
+					if ival=4 then transfer_to$=mid$(coi$,65,31) 
+					if ival=8 then transfer_to$=mid$(coi$,97,31) 
+					if ival=16 then transfer_to$=mid$(coi$,129,31) 
+					if ival=32 then transfer_to$=mid$(coi$,161,31) 
+					if ival=64 then transfer_to$=mid$(coi$,193,31) 
+					if ival=128 then transfer_to$=mid$(coi$,225,31)
+				else
+					if ival=1 then transfer_to$=mid$(x8num$,1,31)
+					if ival=2 then transfer_to$=mid$(x8num$,33,31) 
+					if ival=4 then transfer_to$=mid$(x8num$,65,31) 
+					if ival=8 then transfer_to$=mid$(x8num$,97,31)
+					if ival=16 then transfer_to$=mid$(x8num$,129,31) 
+					if ival=32 then transfer_to$=mid$(x8num$,161,31) 
+					if ival=64 then transfer_to$=mid$(x8num$,193,31) 
+					if ival=128 then transfer_to$=mid$(x8num$,225,31)
+				endif
+				if debug then syslog "Referring to "+transfer_to$ 
+				on_hold=1 : auth=0 : gosub 10200 : rINV()
+			endif
+		else
+			rBYE() : gosub 9006 : return
+		endif
+	endif
+
+	return
+
+'handle RTP payload
+5006
+	'end of event = false?
+	if midget(_Mr$,14,1)<128 then rtpe=0 : return
+	'accept key if it's not a duplicate
+	if rtpe<>1 then
+		x=midget(_Mr$, 13, 1)
+		if x<10 then key$=str$(x)
+		if x=10 then key$="*"
+		if x=11 then key$="#"
+		rtpe=1
+		gosub 8000
+	endif
+
+	return
+
+'extract SDP fields if available
+5007
+	'get SDP destination IP
+	cut$=smsg$ : cfrom$="c=IN IP4 " : cto$=nl$ : gosub 9000 : tmp_dstip$=cut$
+	'get SDP destination port
+	cut$=smsg$ : cfrom$="m=audio " : cto$=" " : gosub 9000 : tmp_dstp=val(cut$)
+	if instr(1, smsg$, "m=fmtp:") then
+		'get RTP payload type number (DTMF in RTP)
+		cut$=smsg$ : cfrom$="m=fmtp:" : cto$=" " : gosub 9000 : l=val(cut$)
+		if and(l>0,l<256) then trpp=l
+	endif
+	return
+
+'generate authorization string
+5008
+	'get Authenticate string
+	cut$=smsg$ : cfrom$="Authenticate: " : cto$=nl$ : gosub 9000 : auth$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="authenticate: " : cto$=nl$ : gosub 9000 : auth$=cut$
+	'get realm, nonce, opaque, uri
+	cut$=auth$ : cfrom$="realm=\"" : cto$="\"" : gosub 9000 : realm$=cut$
+	cut$=auth$ : cfrom$="nonce=\"" : cto$="\"" : gosub 9000 : nonce$=cut$
+	cut$=auth$ : cfrom$="opaque=\"" : cto$="\"" : gosub 9000 : opaque$=cut$
+	' check for the Quality Of Protection
+	cut$=auth$ : cfrom$="qop=\"" : cto$="\"" : gosub 9000 : qop$=cut$
+	if qop$ <> "" then
+		nc=nc+1
+		cnonce$=str$(random())
+	endif
+	'if uri in the auth digest is present, use it
+	cut$=auth$ : cfrom$="uri=\""   : cto$="\"" : gosub 9000
+	if cut$<>"" then inuri$=cut$ else inuri$=lsuri$
+	'build a1
+	if auth_id$ <> "" then
+		temp$ = auth_id$+":"
+	else
+		temp$ = user$+":"
+	endif
+	temp$ = temp$+realm$+":"
+	temp$ = temp$+pass$
+	a1$ = lcase$(md5$(temp$,len(temp$),1))
+	'build a2
+	temp$ = cseqm$+":"
+	temp$ = temp$+inuri$
+	a2$ = lcase$(md5$(temp$,len(temp$),1))
+	'hash "source"
+	temp$ = a1$+":"
+	temp$ = temp$+nonce$
+	if qop$ <> "" then
+		temp$ = temp$ + ":" + sprintf$("%08lu",nc) + ":" + cnonce$ + ":" + qop$
+	endif
+	temp$ = temp$ + ":" +a2$
+	'generate final md5 hash
+	hash$ = lcase$(md5$(temp$, len(temp$), 1))
+	if auth_id$ <> "" then
+		auth$ = "Authorization: Digest username=\"" + auth_id$  '" 
+	else
+		auth$ = "Authorization: Digest username=\"" + user$ 	'"
+	endif
+	auth$=auth$+"\", realm=\""      + realm$ + &
+				"\", nonce=\""      + nonce$ 
+	if opaque$ <> "" then
+	   auth$=auth$+"\", opaque=\""     + opaque$
+	endif
+	auth$=auth$+"\", uri=\""        + inuri$ + &
+				"\", response=\""   + hash$ +"\"" 				'"
+	if qop$ <> "" then
+		auth$=auth$+", qop="      + qop$  +&
+					", nc="       + sprintf$("%08lu",nc)  + &
+					", cnonce=\"" + cnonce$ + "\""             
+	endif
+	auth$=auth$+", algorithm=MD5" + nl$
+	return
+
+' handle call on level (called only if call on level mode enabled)
+5009
+	' nothing to do if audio is closed
+	if mediatype(AUDIO_STREAM)=0 then return
+	'get input level
+	LOCK 1
+	read AUDIO_STREAM,levbf$,-1	'left
+	levl=lastlen(AUDIO_STREAM)
+	read AUDIO_STREAM,levbf$,-2	'right
+	levr=lastlen(AUDIO_STREAM)
+	LOCK 0
+	'if level above threshold while nobody is calling: generate new branch id and send invite
+	if and(or(levl>=levth,levr>=levth),call=1) then
+		if debug then syslog "Level above threshold, call starting"
+		' gosub 5010 : rINV() : gosub 9007 : call=2 : return
+		gosub 5100 : return
+	endif
+	return
+
+' generate new brnch
+5010
+	brnch=or(shl(random(),16),random())
+	return
+
+' check input level in a call
+5012
+	' nothing to do if audio is closed
+	if mediatype(AUDIO_STREAM)=0 then return
+	
+	' The reading of the levels is moved to the  
+	' audio timer routine 8002 to avoid race conditions
+	if or(levlc>=levth,levrc>=levth) then levtm=_TMR_(0)	' NB ! Reusing ring timeout variable!!
+	if _TMR_(0) - levtm > levto then rBYE() : gosub 9006	' voice level timeout, hang up
+
+	return
+
+' VAD (Voice Activity Detection) of the remote partner to
+' control the AI_Phone mode. Make suer you call it only in state 4 (call established)
+5014
+	' nothing to do if audio is closed
+	if mediatype(AUDIO_STREAM)=0 then return
+	
+	' The reading of the levels is moved to the  
+	' audio timer routine 8002 to avoid race conditions
+	' if level above threshold while in a call: the other party is talking, switch AI_Phone to listen mode
+	if or(hdx_level_left >= hdx_level_threshold,hdx_level_right >= hdx_level_threshold) then
+		hdx_receive_tm = _TMR_(0)
+		hdx_mode(HDX_MODE_LISTEN)
+	else
+		if _TMR_(0)-hdx_receive_tm > vadto then hdx_mode(HDX_MODE_TALK)
+	endif
+	return
+
+
+
+'''''''''
+' start a call to current uas$
+5100	
+	' do not allow P2P call with empty uas$
+	if and(p2p>0,len(uas$)=0) then return
+	
+	' do not allow to dial if high priority message is active
+	if and(call=5,notif_prio=0) then return
+	if and(notif_en>0, notif_prio>0) then gosub 32170 	' if low priority message is active, stop it first
+	
+	gosub 9030
+	gosub 5010 : rINV() : gosub 9007 : call=2
+	if close_on_to then reset_timer(CLOSE_ON_TIMEOUT_TIMER) 'timer 4,pktm * 1000	' start the doorstation hang up timer
+	return
+
+8000 'open the door if somebody entered the correct door open code
+'start from scratch if no key has been received for at least 5 seconds
+if and(_TMR_(0)-dtmft>5000, not(keys$="")) then keys$ = key$ : dtmft=_TMR_(0) : return
+
+keys$=keys$+key$
+
+if keys$=doc$ then 'correct door open code has been entered
+	keys$=""
+	'activate door timer
+	ioctl 1, lcktm
+else ' almost a single digit command must be inside keys$
+	if len(keys$)>4 then
+		l=instr(5,keys$,"*")
+		if l then
+			if and(midget(keys$,1,1) = &H23,midget(keys$,3,1)=&H2A) then
+				' if we are here correct command has been received (#C*xxx*) !
+				if debug then syslog dbgrx$ + "DTMF cmd: " + keys$
+				v=midget(keys$,2,1)-&H30 : q = val(mid$(keys$, 4, l-4))
+				if v=2 then rst=q : gosub 20700
+				if v=3 then
+					if x8 then x8os=q : x8wrt(0,q)
+				endif
+				if v=4 then
+					if x8 then
+						x8wrt(275,q)
+						x8io=x8get(275)
+					endif
+				endif
+				if v=5 then rebon=q
+				keys$=""
+			endif
+		endif
+	endif
+endif
+
+dtmft = _TMR_(0)
+
+return
+
+8002 ' audio processing timer
+
+	if call=4 then
+		if mediatype (AUDIO_STREAM) = 0 then return
+		if mediatype (RTP_STREAM) = 0 then return
+		
+		' read the critical audio status values here
+		' to avoid race condition with this timer if done elsewhere
+		' get input levels for closing on level
+		if clsol then
+			read AUDIO_STREAM,levbf$,-1
+			levlc=lastlen(AUDIO_STREAM)
+			read AUDIO_STREAM,levbf$,-2
+			levrc=lastlen(AUDIO_STREAM)
+		endif
+		
+		'get output level in HDX mode to switch Mic/Speaker
+		if hdxen > 0 then 
+			read AUDIO_STREAM,hdx_level_buffer$,-3	'left
+			hdx_level_left=lastlen(AUDIO_STREAM)
+			read AUDIO_STREAM,hdx_level_buffer$,-4	'right
+			hdx_level_right=lastlen(AUDIO_STREAM)
+		endif
+
+		gosub 9200	' send audio
+		gosub 9100	' get audio
+	endif
+	return
+
+'[AD 24.04.2008] collect all the fields of same type, and return them as header lines
+8800
+	col$ = ""
+	i = instr(1, cut$, cfld$) : i = i + len(cfld$)
+8810
+	if i > 0 then
+		z = instr(i, cut$, nl$) + 2
+		if (z-i) < 0 then
+			syslog "Malformed "+cfld$+" field!"
+			return
+		endif
+		col$ = col$ + mid$(cut$, i, z - i) : cut$ = mid$(cut$, z)
+		i = instr(1, cut$, cfld$)
+		goto 8810
+	endif
+	i = len(col$)
+	if i>0 then midset col$, len(col$) - 1, 1, 0
+	return
+
+'[AD 18.04.2008] collect all the fields of same type, and separate them from a comma
+8900
+	col$ = ""
+	8910
+	i = instr(1, cut$, cfld$)
+	if i>0 then
+		cut$ = mid$(cut$, i + len(cfld$))
+		if col$ <> "" then col$ = col$ + ","
+		col$ = col$ + mid$(cut$, 1, instr(1, cut$, nl$)-1)
+		goto 8910
+	endif
+	return
+
+9003 'retx a packet
+	retx=retx+1
+
+	'retx count reached?
+	if retx>4 then
+		timer 2,0
+		retx=0
+		if debug then syslog "Maximum retx count reached."
+		if call>1 then
+			gosub 9006
+		endif
+		return
+	endif
+	
+	smsg$=lssip$
+	gosub 9001
+
+	return
+
+9005 'phone pickup or hangup
+     ' because lack of timers, we have to share timer 4. Every 100ms we check it
+
+     	if and(pk_toen > 0, _TMR_(0) - pk_totm > pk_to) then process_tmr4=1 ' gosub 9051
+	if and(close_on_toen > 0, _TMR_(0) - close_on_to > close_on_tm) then process_tmr5=1 ' gosub 9052
+	return
+
+9051    ' pk_to timer handling
+	pk_toen = 0		' disable the pickup/hangup timer
+
+	if debug then syslog "Performing auto respond/hangup"
+
+	if pkmod=1 then s200(1) : gosub 9011 : goto 9551 ' return	' pickup
+	if pkmod=2 then s603() : gosub 9006 ' : return 	' hangup
+9551
+	process_tmr4=0
+	return
+
+9052	' close on timeout timer event handling
+
+	close_on_toen = 0	' disable the pickup/hangup timer
+	if debug then syslog "Closing call on timeout ..."
+	if close_on_to > 0 then rCAN() : gosub 9006 : call=1 	' cancel initiated call
+	process_tmr5=0
+	return
+
+9006 'end a call
+	' always clear the remote party string
+	' NB! If we are initiating priority message, do not clear the remote party
+	' we have set it and call=5 in advance!
+	if call <> 5 then srmt_party$ = ""
+	' was ringing ?
+	if or(call=2,call=3) then gosub 9061
+
+	' close also the configured relay
+	if and(relay_on>0,iostate(relay_on)=1) then ioctl relay_on,0
+
+	' reset uas$ to call on level
+	uas$=clev$ : gosub 9030
+
+	' start the AI_PHONE timer to avoid calling in the next 5 seconds after call end
+	if aiphone_enable > 0 then aiphone_tm = _TMR_(0)
+
+	' set call state ready for the next call
+	' NB! If we cancel the call because higj priority  message has arrived
+	' the call state can be set to 1 (idle because the incoming SIP 487 message
+	' will call 9006, so take kare for this case
+	if and(call=5,notif_prio=0) then 
+		if debug then syslog "High priority message active, remaining in state " +str$(call)+" !"
+	else
+		call=1
+	endif
+	
+	' reset hang up timer a BYE can be received before the hang up
+	' FIXME Should we take care incoming/outgoing call here?
+	stop_timer(PICKUP_TIMER) 'timer 4, 0
+	
+	if notif_en then return	' do not restart BGM if we have priority message
+
+	' if BGM was set and no rebroadcasting, need to be reopened
+	' if and(rebon=0, bgmport) then gosub 32100	' do not reopen it here, it is done in idle state!
+
+	return
+
+9061
+	ringn=0
+	return
+
+
+9007 'initiate a call
+	if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+	open "AUD:11,0,2056,0" as AUDIO_STREAM	' start "ringn"
+	rngto=_TMR_(0) 			' reset ring timeout
+	ringn=1
+
+	return
+
+9008 'start a call
+	'lsrtp=_TMR_(0) 'reset rtp timeout
+	rngto=_TMR_(0) 'reset ring timeout
+	infid=0 'reset INFO last cseq id
+	' timer 4, 0 'disable answering timer
+	if incm=0 then
+		' disable close on timeout timer
+		stop_timer(CLOSE_ON_TIMEOUT_TIMER)
+	else
+		' disable answering timer
+		stop_timer(PICKUP_TIMER)
+	endif
+	gosub 9061 'stop "ringn"
+	
+	' store the in call Call ID, From, and To values to be used
+	' later by the BYE message to close properly the call
+	if incm=1 then
+		incid$=invid$
+		inc_from$=invite_from$
+		inc_to$=invite_to$
+	else
+		incid$=out_invid$
+		inc_from$=out_invite_from$
+		inc_to$=out_invite_to$
+	endif
+	
+	' remember the RTP destination ip and port, and do not change it
+	' as we do not really support reINVITES. 
+	' If we do not remember them then second incoming call during 
+	' active call state will change the sending port and the remote 
+	' party in the active call will stop receiving audio
+	dstip$=tmp_dstip$
+	dstp=tmp_dstp
+	
+	' flush input buffer
+	call=4 'call active
+	if clsol then levtm=_TMR_(0)		' set the close on level timer so that we do not close
+						' immediately after answer
+	rtpin$=""
+	
+	' disable the relay on ring
+	if rel_on_ring then
+		if iostate (rel_on_ring) = 1 then ioctl rel_on_ring,0
+	endif
+	
+	' enable relay on call answer if configured
+	if relay_on > 0 then ioctl relay_on,1
+
+	return
+
+9009 'gets the request or status code
+	req$ = mid$(smsg$,1,instr(1, smsg$, " ")-1) 'get request field
+
+	'get status code if it's a status message
+	if req$=protv$ then
+		req$=mid$(smsg$,len(protv$)+2,3)
+	endif
+
+	return
+
+9010 ' open audio device in RTP mode
+	open aurtp$ as AUDIO_STREAM
+	
+	write AUDIO_STREAM, str$(again),-2		'set A/D Gain
+	write AUDIO_STREAM, str$(mgain),-1		'set Mic Gain
+	write AUDIO_STREAM, str$(inp),-3		'set input source to mic/line
+	write AUDIO_STREAM, "0",-4			'set mono, fixed
+	write AUDIO_STREAM, "0",-8                'set neutral balance
+	setvol (vol)
+	write AUDIO_STREAM,""
+
+	return
+	
+9011 ' start call with beep
+	if incm=1 then
+		if beep_in_answer then call=7 else gosub 9008
+	else
+		if beep_out_answer then call=7 else gosub 9008
+	endif
+	return
+	
+9020 'sends a SIP-message directly to the remote peer
+	if route_ip$="" then
+		' normal case
+		write SIP_CONTROL_STREAM,smsg$,0,bpip$,bpp
+	else	
+		' we have proxies, send to the last proxy IP
+		' detected from the Record-Route field
+		write SIP_CONTROL_STREAM,smsg$,0,route_ip$,bpp
+	endif
+	if debug then gosub 9009 : syslog dbgbp$+req$
+	smsg$=""
+
+	return
+
+9030
+	'if in peer to peer mode and empty destination is given, set one
+	if len(uas$) > 0 then
+		if p2p > 0 then
+			if instr(1,uas$,"@") then
+				pbxip$=mid$(uas$,instr(1,uas$,"@")+1)
+			else
+				pbxip$=uas$
+			endif
+		else
+			'assumption, callee domain missing, using same pbx where we are
+			if instr(1,uas$,"@")=0 then
+				uas$=uas$+"@"+pbx$
+			endif
+		endif
+	endif
+
+	return
+
+9040    ' open priority audio in RTP mode
+	' autodetect the RTP payload
+	
+	notif_mode=0	' preset to mono
+	
+	if notif_pload = 0  then notif_rtp$="AUD:11,1,2056"  : goto 9045		
+	if notif_pload = 8  then notif_rtp$="AUD:11,1,2312"  : goto 9045		
+	if notif_pload = 10 then notif_rtp$="AUD:11,1,6700"  : notif_mode=1 : goto 9045	
+	if notif_pload = 11 then notif_rtp$="AUD:11,1,2604"  : goto 9045		
+	if notif_pload = 14 then notif_rtp$="AUD:1,3,0"     : goto 9045		
+	if notif_pload = 96 then notif_rtp$="AUD:11,1,2568"  : goto 9045		
+	if notif_pload = 97 then notif_rtp$="AUD:11,1,2072"  : goto 9045        	
+	if notif_pload = 98 then notif_rtp$="AUD:11,1,2328"  : goto 9045        	
+	if notif_pload = 99 then notif_rtp$="AUD:11,1,2584"  : goto 9045        	
+	if notif_pload =100 then notif_rtp$="AUD:11,1,2080"  : goto 9045        	
+	if notif_pload =101 then notif_rtp$="AUD:11,1,2336"  : goto 9045        	
+	if notif_pload =102 then notif_rtp$="AUD:11,1,2592"  : goto 9045        	
+	if notif_pload =103 then notif_rtp$="AUD:11,1,6704"  : goto 9045        	
+	if notif_pload =104 then notif_rtp$="AUD:11,33,2568" : goto 9045       		
+	if notif_pload =105 then notif_rtp$="AUD:11,33,2584" : goto 9045       		
+	if notif_pload =106 then notif_rtp$="AUD:11,33,2592" : goto 9045       		
+	if notif_pload =107 then notif_rtp$="AUD:11,33,6700" : notif_mode=1 : goto 9045	
+	if notif_pload =108 then notif_rtp$="AUD:11,33,6704" : notif_mode=1 : goto 9045 
+	if notif_pload =109 then notif_rtp$="AUD:11,1,2060"  : goto 9045        	
+	if notif_pload =110 then notif_rtp$="AUD:11,1,2316"  : goto 9045        	
+	if notif_pload =111 then notif_rtp$="AUD:11,1,2572"  : goto 9045        	
+	if notif_pload =112 then notif_rtp$="AUD:11,33,2572" ': goto 9045        	
+	
+	' in  case of unsupported RTP payload do not play
+'	if debug then syslog "Unsupported payload type detected, ignoring priority audio for the next 2 seconds..."
+'	notif_next_tm=_TMR_(0)
+'	call=1 : notif_en=0
+'	return
+
+	
+9045	notif_pload=-1			' reset the payload to prevent wrong audio open
+	notif_rtp$=notif_rtp$ + "," + str$(notif_buff)
+	open notif_rtp$ as AUDIO_STREAM	' open audio according the RTP payload
+	
+	write AUDIO_STREAM, str$(again),-2		'set A/D Gain
+	write AUDIO_STREAM, str$(mgain),-1		'set Mic Gain
+	write AUDIO_STREAM, str$(inp),-3		'set input source to mic/line
+	write AUDIO_STREAM, str$(notif_mode),-4   'set mono/stereo
+	write AUDIO_STREAM, "0",-8                'set neutral balance
+	setvol(notif_vol)
+	write AUDIO_STREAM,""
+
+	return
+
+9100	' get audio
+9105	l_read=lastlen(RTP_STREAM)
+
+	if l_read<0 then
+		temp_host$=rmthost$(RTP_STREAM)
+		read RTP_STREAM,_Mr$,-l_read
+		if rtpin$="" then
+			rtpin$=temp_host$
+		else
+			if temp_host$<>rtpin$ then
+				syslog "Change of remote host: was "+rtpin$+" ,changed to "+temp_host$
+				rtpin$=temp_host$
+				if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+				gosub 9010
+			endif
+		endif
+		if midget(_Mr$,2,1)=trpp then gosub 5006 : return 'check for DTMF RTP payload
+			
+		if l_read < 0 then l_read = 0 - l_read
+
+		write AUDIO_STREAM,_Mr$,l_read ' play, for all, pt check not needed (BCL MAN 9.2.3)
+		if and (call=4, rebon > 0)  then
+		 	' rebroadcast ?
+			if rebp then write RTP_STREAM,_Mr$,l_read,rebr$,rebp
+		endif
+		goto 9105 	' loop until buffer empty
+	endif
+
+	' Common part for LINK and manual audio handling
+	if stream_timeout > 0 then
+		' close call if no incoming audio stream for some time
+		' take care when using link
+		if _TMR_(0) - call_start_time > 2000 then
+			' give 2 seconds "grace" period the SIP client to
+			' start receiving stream
+			read AUDIO_STREAM,_Mr$,-21
+			last_pkt=lastlen(AUDIO_STREAM)
+			if _TMR_(0) - last_pkt > stream_timeout then
+				syslog "Audio stream timeout, closing call!"
+				rBYE()
+				gosub 9006
+			endif
+		endif
+	endif
+
+	return
+
+9200	' send audio
+
+	' in case of exstreamer and IP speaker, send a fake RTP packet in order to establish audio behind NAT
+	' and ignore reading from the audio input as we do not have such in Exstreamer and IP Speaker
+
+	' using 2 one line IFs is faster than or (htype=14. htype=36) statement, 
+	' so use it here because timing is critical
+	if htype=HW_EXSTREAMER_100 then write RTP_STREAM,_Ma$,12,dstip$,dstp : return
+	if htype=HW_EXSTREAMER_200 then write RTP_STREAM,_Ma$,12,dstip$,dstp : return
+	if htype=HW_EXSTREAMER_110 then write RTP_STREAM,_Ma$,12,dstip$,dstp : return
+	if htype=HW_EXSTREAMER_120 then write RTP_STREAM,_Ma$,12,dstip$,dstp : return
+	if htype=HW_EXSTREAMER_P5  then write RTP_STREAM,_Ma$,12,dstip$,dstp : return
+	if htype=HW_EXSTREAMER_205 then write RTP_STREAM,_Ma$,12,dstip$,dstp : return
+	
+	if uselink then return	' we should sent fake RTP packets also when using LINK
+	
+9202	read AUDIO_STREAM,_Ms$ : l_send=lastlen(AUDIO_STREAM)
+
+        if l_send then
+            if hdxen > 0 then
+                if hdx_state = HDX_MODE_TALK then write RTP_STREAM,_Ms$,l_send,dstip$,dstp : goto 9202 	' send audio until buffer is empty
+            else
+                ' in FDX mode we send always
+                write RTP_STREAM,_Ms$,l_send,dstip$,dstp : goto 9202
+            endif
+	endif
+
+	return
+	
+	
+9300	' set and keep track of the volume
+	local vol_to_set
+	if mediatype(AUDIO_STREAM)=0 then return
+	if debug then syslog "Old volume="+str$(current_volume)
+	write AUDIO_STREAM, str$(vol_to_set),-12
+	current_volume=vol_to_set
+	if debug then syslog "New volume="+str$(current_volume)
+	return
+
+9350	' process_pbx_list	
+	'goes through the list of PBX, and sets PBX ports if available
+	if instr(1, pbx1$, ":") then
+		'set port number
+		pbxp1 = val(mid$(pbx1$, instr(1, pbx1$, ":")+1))
+		'remove port number
+		pbx1$ = mid$(pbx1$, 1, instr(1, pbx1$, ":")-1)
+	else
+		'default PBX port
+		pbxp1 = 5060
+	endif
+
+	if instr(1, pbx2$, ":") then
+		'set port number
+		pbxp2 = val(mid$(pbx2$, instr(1, pbx2$, ":")+1))
+		'remove port number
+		pbx2$ = mid$(pbx2$, 1, instr(1, pbx2$, ":")-1)
+	else
+		'default PBX port
+		pbxp2 = 5060
+	endif
+	
+	' in peer to peer, port must be well-known
+	if p2p then
+		sipp = 5060
+		rtpp = 5004
+	endif
+
+	return
+	
+9500	'set_active_pbx
+	local next_pbx
+	if and(next_pbx=1,pbxi1<>0) then
+		pbx$=pbx1$
+		pbxp=pbxp1
+		pbxip$ = sprintf$("%lA", pbxi1)
+		active_pbx=1
+		goto 9501
+	endif
+	if and(next_pbx=2,pbxi2<>0) then
+		pbx$=pbx2$
+		pbxp=pbxp2
+		pbxip$=sprintf$("%lA", pbxi2)
+		active_pbx=2
+	endif
+	
+9501
+	return
+
+
+' custom functions
+'''''''''
+' unconfigured application
+20000
+	syslog "Please configure the application."
+	if htype=HW_ANNUNCICOM_PS_16 then message(5)
+	end
+
+	return
+
+'''''''''
+' authn : handle unauthenticated request needed, Auth or Proxy-Auth
+20100
+
+	LOCAL ant
+
+	auth = ant
+
+	gosub 5008
+
+	authn = 0
+	return
+
+'''''''''
+' get device I/O states, could be 32, limit to 8 for now
+20500
+
+	if or(htype=HW_IPAM_100,htype=HW_IPAM_102,htype=HW_CARRIER_IPAM_100) then
+		' remap inputs 4,5,6 to 1,2,3
+		q=255
+		if iostate(204)=0 then q=and(q,&HFE)
+		if iostate(205)=0 then q=and(q,&HFD)
+		if iostate(206)=0 then q=and(q,&HFB)
+		ist=q
+		return
+	endif
+	q=0 : l=0
+	for v=1 to 8
+		if iostate(v) > 0 then q=or(q,shl(1,v-1))
+	next v
+	rst=q ' atomic
+	q=0 : q2 = 0
+	for v = 201 to 208
+		' syslog "Input  "+str$ (v)+ " state is" + str$(iostate(v))
+		if and(iostate(v),1) > 0 then q=or(q,shl(1,v-201))
+		if and(htype=HW_ANNUNCICOM_155, and(iostate(v),2) > 0) then q2=or(q2,shl(1,v-201))	'for Ann 155 read the supervised states (the second bit set)
+
+	next v
+
+	if htype=HW_ANNUNCICOM_PS_16 then	' read the next 8 keys for PS16
+		for v = 209 to 216
+			if and(iostate(v),1) > 0 then q=or(q,shl(1,v-201))
+		next v
+	endif
+
+
+	ist=q 		' atomic
+	sup_inputs=q2	' atomic
+
+	return
+
+'''''''''
+' set device relays
+20700
+	for x = 1 to 8
+		ioctl x, and(q,1)
+		q=shr(q,1)
+	next x
+
+	return
+
+'''''''''
+' message : Print message to the PS16 display
+25000
+	local msg
+	write -2,"\x1b[2J",0		' clear screen
+	if msg=1 then write -2, "SIP Client\n"+ver$,0 : return
+	if msg=5 then write -2, "Please configure \nthe SIP client!",0 : return
+	
+	' adjust the remote party ID
+	' remove the html escape tags for "<" and ">"
+	ps16_rmt$=srmt_party$
+	ps16_tmp=instr(1,ps16_rmt$,"&#60;")
+	if ps16_tmp>0 then ps16_rmt$=mid$(ps16_rmt$,1,ps16_tmp-1)+"<"+mid$(ps16_rmt$,ps16_tmp+5)
+	ps16_tmp=instr(1,ps16_rmt$,"&#62;")
+	if ps16_tmp>0 then ps16_rmt$=mid$(ps16_rmt$,1,ps16_tmp-1)+">"+mid$(ps16_rmt$,ps16_tmp+5)
+	
+	' ps16 can display only 24 chars per line
+	if len(ps16_rmt$)>24 then ps16_rmt$=mid$(ps16_rmt$,1,24)
+	
+	if msg=2 then write -2, "Outgoing call:"+"\n"+ps16_rmt$,0 : return
+	if msg=3 then write -2, "Incoming call:"+"\n"+ps16_rmt$,0 : return
+	if msg=4 then write -2, "In active call:"+"\n"+ps16_rmt$,0 : return
+
+	return
+
+
+'''''''''
+' x8chk : X8 presence check
+30000
+	x8chk = 0
+
+	if debug then syslog "checking for x8 ..."
+
+	if mediatype(X8_COM_PORT) = 0 then open x8init$ as X8_COM_PORT ' Open it once, never close it!
+
+	if mediatype(X8_COM_PORT) then
+		x = x8get(256)
+		if x = &HB2 then x8chk = 1 ' else close X8_COM_PORT  	' leave it open
+	else
+		syslog "Cannot open com port, exiting" : end
+	endif
+
+	return
+
+'''''''''
+' x8swp : swap 16 bit for sending
+30005
+	LOCAL inval
+
+	x8swp = or(and(shl(inval,8),&HFF00),shr(inval,8))
+
+	return
+
+
+'''''''''
+' x8get : get X8 holding register
+30010
+	LOCAL x8add
+
+	x8get = 0
+	midset x8tmp$, 1, 2, &H03ff
+	midset x8tmp$, 3, 2, x8swp(x8add)
+	midset x8tmp$, 5, 2, &H0100
+	midset x8tmp$, 7, 2, mbcrc(6)
+	write X8_COM_PORT, x8tmp$, 8
+'	delay 40
+	delay 10
+	read  X8_COM_PORT, x8tmp$
+	if htype=HW_ANNUNCICOM_155 then
+		' in RS485 we shall use direct cable, we do not
+		' need to ignore the loopback caused by the cable
+		' used to convert R232 <--> RS485
+		if lastlen(X8_COM_PORT) = 7 then
+			x8add = mbcrc(5)
+		else
+			x8get = -1 : goto 30027 ' bad read
+		endif
+	else
+		' RS232 on COM 1 with the 2 resistor "conversion" cable
+'		syslog "read bytes: " + str$(lastlen(X8_COM_PORT))
+		if lastlen(X8_COM_PORT) = 8 + 7 then
+			midcpy x8tmp$, 1, 7, x8tmp$, 9
+			x8add = mbcrc(5)
+		else
+			x8get = -1 : goto 30027 ' bad read
+		endif
+	endif
+
+	if x8add = midget(x8tmp$, 6, 2) then
+		x8get = shl(midget(x8tmp$, 4, 1),8) + midget(x8tmp$, 5, 1)
+	else
+		x8get = -1 : goto 30027 ' bad crc
+	endif
+
+30027
+	return
+
+'''''''''
+' x8wrt : write X8 register
+30030
+
+	LOCAL waddr, regst
+
+	midset x8tmp$, 1, 2, &H06ff					' address fixed to 255
+	midset x8tmp$, 3, 2, x8swp(waddr)
+	midset x8tmp$, 5, 2, x8swp(regst)
+	midset x8tmp$, 7, 2, mbcrc(6)
+
+	write X8_COM_PORT, x8tmp$, 8 : delay 20
+	'discard reply for now
+	read X8_COM_PORT, x8tmp$
+
+	x8wrt = 0
+	return
+
+'''''''''
+' mbcrc : X8 crc calculation in x8tmp$
+30100
+
+	LOCAL payld
+
+	x=&HFFFF
+
+	for i=1 to payld
+		x=xor(x,midget(x8tmp$,i,1))
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+		if and(x,1) then x=x/2:x=xor(x,&HA001) else x=x/2
+	next i
+
+	mbcrc=x
+
+	return
+'''''''''
+' cmdin : command in, len in l, payload in _Mr$
+'         reusage, _Ms$=rmthost, i=rmtport
+31000
+
+	' termination
+	l = instr(1,_Mcom$,"\r")
+	' support for unix lf
+	if l=0 then l=instr(1,_Mcom$,"\n")
+	if l=0 then l=len(_Mcom$)	' accept also strings not terminated with LF/CR
+
+	if l then
+		midset _Mcom$,l+1,1,0
+		v=midget(_Mcom$,1,1)
+		if v=&H44 then gosub 31100  ' D: DA-Answer call;DS-Stop call;DH-High prio call
+		if v=&H51 then gosub 31200	' Q: Query status
+		if v=&H58 then gosub 31300  ' X: Send data to COM port
+		if v=&H52 then gosub 31400	' R: Relays On/Off
+		if v=&H54 then gosub 31500	' T: TQ-Target Query; TS - Target set
+		if v=&H46 then gosub 31600	' F: Call transfer (Forward
+	endif
+
+	cmdin=0
+	return
+
+'''''''''
+' Command D
+31100
+
+	v = midget(_Mcom$,2,1)
+	if v=&H41 then
+		' DA - answer call command
+		syslog "received DA command"
+		if call=3 then
+			' if it is pkmod 1,2 and the call is incoming, clear the pickup timer
+			if incm>0 then
+				if or(pkmod=1,pkmod=2) then stop_timer(PICKUP_TIMER)
+			else
+				' on outgoing call, also clear the close on timeout timer
+				if close_on_to then stop_timer(CLOSE_ON_TIMEOUT_TIMER)
+			endif
+			s200(1) : gosub 9011
+		endif
+		goto 31101
+	endif
+		
+	if or(v=&H53,v=&H48) then
+		' DS - stop call, DH - High prio call
+		' in call outgoing call setup? Cancel it
+		if call=2 then 
+			rCAN() 
+			stop_timer(CLOSE_ON_TIMEOUT_TIMER) 
+			call=1 : goto 31101
+		endif
+		if call=3 then 
+			s603()
+			stop_timer(PICKUP_TIMER)
+			call=1 : goto 31101
+		endif
+		' in active call? Drop it, and change to call=1 (done in 9006)
+		if call=4 then rBYE() : gosub 9006 
+		
+		if v=&H53 then goto 31101
+		
+		' until now, both DS and DH are common - will drop current call
+		if or(call=1,call=5) then 
+			if v=&H48 then 
+				if or(l=2,and(l>2,or(midget(_Mcom$,3,1)=13,midget(_Mcom$,3,1)=10))) then 
+					syslog "received DH command without number... ignoring!"
+					goto 31101	' no number following: return
+				endif
+				q=3
+			endif
+		else
+			goto 31101
+		endif
+	else
+		' low prio D command
+		' do call only if in idle mode
+		q=2 : if call>1 then goto 31101 
+	endif
+		
+	v=l-q
+	if v > 0 then
+		temp$=mid$(_Mcom$,q,l-q)
+		uas$ = temp$
+		syslog "DH/D calling " + uas$
+		gosub 5100
+	endif
+
+31101	if apiin=CGI_STREAM then _CGI_$=" "	' when _CGI_$ is empty, the basic.cgi handler  does not send HTTP 200 OK, 
+						' so assign it to a space to be able to send it
+	return
+
+'''''''''
+' Command Q
+31200
+
+	temp$=""+user$+",S"+str$(call-1)+","	' Start with the user ID (phone number)
+	temp$ = temp$+sprintf$("%02x",ist)+","+sprintf$("%02x",rst)
+
+	if apiin=CGI_STREAM then _CGI_$=temp$ : return
+	if apiin=UDP_CONTROL_STREAM then write UDP_CONTROL_STREAM,temp$,len(temp$),com_send_ip$,inprt : return
+	if apiin=TCP_CONTROL_STREAM then
+		if connected(TCP_CONTROL_STREAM)=0 then return
+	endif
+	write apiin, temp$ ' tcp and serial
+
+	return
+
+'''''''''
+' Command X
+31300
+
+	' nothing to do if X8 is connected, or COM port closed
+	if or(x8=1,mediatype(COM_PORT)=0) then goto 31301 'return
+		
+	xout=0
+	if l=3 then
+		' disable bridge ?
+		if midget(_Mcom$,2,1)=&H53 then xout=0 : goto 31301 'return
+	endif
+
+	l=instr(1,_Mcom$,"\r") ' get the data bytes and send them out
+	if l=0 then l=instr(1,_Mcom$,"\n") ' unix eol
+	if l then
+		l=l-2 : q=1
+		if l%2 then l=l-1
+		for i=1 to l
+			' hex input check
+			x=midget(_Mcom$,q+i,1)
+			if x<&H30 then goto 31301 'return
+			if x>&H66 then goto 31301 'return
+			if and(x>&H39,x<&H41) then goto 31301 'return
+			if and(x>&H46,x<&H61) then goto 31301 'return
+		next i
+		write COM_PORT,mid$(_Mcom$,2,l),l 	' serial 1 only
+		if xout<>COM_PORT then xout=apiin 	' can be also echo from->to same api port
+	endif
+
+31301	if apiin=CGI_STREAM then _CGI_$=" "		' when _CGI_$ is empty, the basic.cgi handler  does not send HTTP 200 OK, 
+							' so assign it to a space to be able to send it
+	return
+
+'''''''''
+' Command R
+' relay control
+31400
+	rl=len(_Mcom$)
+	if mid$(_Mcom$,2,1)="=" then
+		' command format: R=0/1 to turn off/on relay 1
+		if rl<3 then syslog "Not sufficient length of the R=0/1 command, ignoring it!" : goto 31401
+		if mid$(_Mcom$,3,1)="1" then 
+			if debug then syslog "Switching on relay 1 via the API"
+			ioctl 1,1
+		else 
+			if mid$(_Mcom$,3,1)="0" then
+				if debug then syslog "Switching off relay 1 via the API"
+				ioctl 1,0
+			else
+				syslog "Unsupported value " + mid$(_Mcom$,3,1) + " for relay control received, ignoring the R command"
+			endif
+		endif
+	else
+		' command format: Rxxx, where xxx is the 8 bit mask to enable/disable the relays
+		if rl<2 then syslog "Not sufficient length of the Rxxx command, ignoring it!" : goto 31401
+		rmask = val(mid$(_Mcom$, 2, l-2))
+		if or(rmask>255,rmask<0) then 
+			syslog "Wrong relay mask="+str$(rmask)+", please correct the R command!"
+		else
+			rst=rmask : q=rmask : gosub 20700
+		endif
+	endif
+31401
+	if apiin=CGI_STREAM then _CGI_$=" "
+	return
+	
+'''''''''
+' Command T
+' Call ID0 set/query
+31500
+	rl=len(_Mcom$)
+	if mid$(_Mcom$,2,1)="Q" then
+		' TQ (target query, return Call ID 0
+		temp$=""+mid$(coi$,1,31)	' get Call ID0
+		syslog "TQ: temp$="+temp$
+		' send via the requested API channel
+		if apiin=CGI_STREAM then _CGI_$=temp$ : return
+		if apiin=UDP_CONTROL_STREAM then write UDP_CONTROL_STREAM,temp$,len(temp$),com_send_ip$,inprt : return
+		if apiin=TCP_CONTROL_STREAM then
+			if connected(TCP_CONTROL_STREAM)=0 then return
+		endif
+		write apiin, temp$ ' tcp and serial
+	else
+		if mid$(_Mcom$,2,1)="S" then
+			' TS (target set) command, set temporally the Call ID0
+			if or(rl<3,rl>33) then syslog "TS command: target ID is out of range, ignoring!" : goto 31501
+			' clear the ID first
+			for ri=1 to 31
+				midset coi$,ri, 1,0
+			next ri
+			' copy the value
+			midcpy coi$,1, rl-2,_Mcom$,3
+			' remove any \r \n 
+			for ri=1 to 31
+				rn$=mid$(coi$,ri,1)
+				if or(rn$="\r",rn$="\n") then midset coi$,ri,1,0
+			next ri
+31501		if apiin=CGI_STREAM then _CGI_$=" "
+		else
+			syslog "Invalid T[Q/S] command, ignoring it!"
+		endif
+	endif
+	
+	return
+
+'''''''''
+' Command BLIND TRANSFER (SIP REFER)	
+31600	
+	temp_cgi$=""
+	if refer_en=0 then temp_cgi$="REFER not allowed!" : goto 31601
+	if call<>4 then temp_cgi$="Not in active call!" : goto 31601
+	' get the extension to tranfer
+	if l>2 then
+		transfer_to$=mid$(_Mcom$,2,l-2)
+		temp_cgi$="Referring to "+transfer_to$
+		if debug then syslog temp_cgi$
+	else 						
+		temp_cgi$="No number provided!" : goto 31601
+	endif
+	
+	' do the call transfer
+	on_hold=1
+	auth=0 : gosub 10200 : rINV()		' INVITE(hold) without auth and "a=recvonly" in the SDP
+	
+31601	if apiin=CGI_STREAM then _CGI_$=temp_cgi$ : return
+	if apiin=UDP_CONTROL_STREAM then write UDP_CONTROL_STREAM,temp_cgi$,len(temp_cgi$),com_send_ip$,inprt : return
+	if apiin=TCP_CONTROL_STREAM then
+		if connected(TCP_CONTROL_STREAM)=0 then return
+	endif
+	write apiin, temp_cgi$ ' tcp and serial
+
+	return
+
+' ringtone
+32000
+	' BGM_STREAM handle is shared with RINGING_STREAM, so close it
+	if mediatype(BGM_STREAM) then close BGM_STREAM
+	open "F_R:baring.wav" as RINGING_STREAM
+	return
+
+' start BGM, no more streams, reuse 6
+32100
+	if bgmport then
+		if mediatype(BGM_STREAM) then close BGM_STREAM
+		open "UDP:"+bgmad$+":"+str$(bgmport) as BGM_STREAM
+		if mediatype(BGM_STREAM) then
+			if mediatype(AUDIO_STREAM) then close AUDIO_STREAM
+			open  "AUD:1,3,0,"+str$(bgmbuff) as AUDIO_STREAM
+			setvol(bgmvol)
+			
+			if lastlen(BGM_STREAM)<0 then
+				' get the real IP
+				srmt_party$="BGM from: " + rmthost$(BGM_STREAM)+":"+str$(rmtport(BGM_STREAM))
+			else	
+				' print the preconfigured IP
+				srmt_party$="BGM from: "+bgmad$+":"+str$(bgmport)
+			endif
+			link BGM_STREAM, AUDIO_STREAM, bgm_dest
+			
+			bgmen=1
+			if debug then syslog "BGM Started!"
+		else
+			syslog "Can't open BGM, ignoring BGM playback!"
+		endif
+	endif
+
+	return
+
+' stop BGM
+32150
+	if mediatype(BGM_STREAM) then close BGM_STREAM 		' When using LINK with UDP, close UDP first
+	if mediatype(AUDIO_STREAM) then close AUDIO_STREAM	' and then audio ...
+	bgmen=0
+
+	return
+	
+' stop the notification message
+32170	
+	' close LINK, and exit closing UDP first
+	if mediatype(NOTIFY_STREAM) then close NOTIFY_STREAM
+	if mediatype(AUDIO_STREAM) then 
+		write AUDIO_STREAM,""		' flush buffer
+		close AUDIO_STREAM
+	endif
+	
+	' turn off the relay if configured
+	if and(relay_on > 0,notif_relay>0) then ioctl relay_on,0
+
+	notif_en=0 ': gosub 9006
+	if debug then syslog "Closing notification audio ..."
+	'callp=-1	' reset the callp so that we can restore the audio 
+			' if the stop was cause by RTP packet drops for the zero
+			' count time
+	' keep the UDP handle open !
+	if mediatype(NOTIFY_STREAM)=0 then open "UDP:"+notif_addr$+":"+str$(notif_port) as NOTIFY_STREAM
+
+	notif_next_tm=_TMR_(0)
+	
+	return
+
+' get some variable status for the home page
+32200
+  	svol=vol * 5			' volume for the webUI in %
+
+  	if htype=HW_ANNUNCICOM_155 then		' Ann 155 specific
+  		' do speaker supervision
+  		if spk_test_en > 0 then
+  			Syslog "Speaker Test Enabled !"
+			syslog "sa155_spk=" + str$(iostate(210))
+  			if iostate (101) = 0 then ioctl 101, 1 : spk_test_tmr = _TMR_(0)
+  			if _TMR_(0) - spk_test_tmr > 20000 then  ' we need 10 seconds to do the measurement
+  				if iostate(210) = 0 then sa155_spk$ = "Connected"
+  				if iostate(210) = 1 then sa155_spk$ = "Disconnected or broken"
+  				if iostate(210) = 2 then sa155_spk$ = "Invalid measurement"
+  				' stop the 11 Hz pulse
+  				ioctl 101,0 : spk_test_en = 0
+  			else
+  				sa155_spk$ = "Testing ..."
+  			endif
+  			syslog "sa155_spk$="+sa155_spk$
+  		endif
+
+  		' get internal temperature
+  		sa155_temp = iostate(501) / 100
+
+  		' get Mic status
+  		if iostate(211) = 0 then sa155_mic$ = "Connected"
+  		if iostate(211) = 1 then sa155_mic$ = "Disconnected or broken"
+  		if iostate(211) = 2 then sa155_mic$ = "Invalid measurement"
+  	endif
+
+	if mediatype(AUDIO_STREAM) then
+		LOCK 1
+  		read AUDIO_STREAM, sweb$, -13
+  		spill = lastlen (AUDIO_STREAM)		' Left Input peak level
+  		if spill < -100 then spill=-99
+
+  		read AUDIO_STREAM, sweb$, -14
+  		spilr = lastlen (AUDIO_STREAM)		' Right Input peak level
+  		if spilr < -100 then spilr=-99
+
+  		read AUDIO_STREAM, sweb$, -15		' left output peak level
+  		spoll = lastlen (AUDIO_STREAM)
+  		if spoll < -100 then spoll=-99
+
+  		read AUDIO_STREAM, sweb$, -16		' right output peak level
+  		spolr = lastlen (AUDIO_STREAM)
+  		if spolr < -100 then spolr=-99
+  		LOCK 0
+  	else
+  		'put down to 0 when audio is not open
+  		spill=-99:spilr=-99
+		spoll=-99:spolr=-99
+	endif
+
+  	sregt = regto - _TMR_(1)	' time till next registration
+  	if sregt > 0 then 		' prevent display of "negative" values
+  		sregt = sregt / 1000
+  	else
+  		sregt = 0
+  	endif
+
+	if htype=HW_ANNUNCICOM_PS_16 then		' update the display and blink keys of PS16
+		if and(ps16_key>0,or(call=2,call=3)) then ioctl 1000+ps16_key,_DTS_%2 	' blink key
+		if call=ps_state then return
+		ps_state = call
+		' clear all leds first
+		for i = 1001 to 1016
+			ioctl i, 0
+		next i
+
+		if call=1 then message(1):ps16_key=0
+		if call=2 then message(2)		' ps16_key should be already set from button press
+                if call=3 then message(3):ps16_key=1 	' always blink key 1 for all incoming calls
+		if call=4 then message(4):ioctl 1000+ps16_key,1
+	endif
+
+	return
+
+32300	' asc2hex: converts ascii hex into a 32-bit integer
+	' the input binary string contains one hex digit per byte
+	' in BCL integers are 32 bit signed, the result may be negative,
+
+	local ascii$(10), ltmp1,ltmp2
+	asc2hex=0
+	ascii$=lcase$(ascii$)
+	for ltmp1=1 to 8
+		asc2hex=asc2hex*16
+		ltmp2=midget(ascii$,ltmp1,1)
+		if and(ltmp2>=asc("0"),ltmp2<=asc("9")) then asc2hex=asc2hex+ltmp2-asc("0")
+		if and(ltmp2>=asc("a"),ltmp2<=asc("f")) then asc2hex=asc2hex+ltmp2-asc("a")+10
+	next ltmp1
+	return
+
+
+32350	' reset (restart) timer
+	' this is part of timer 4 sharing
+	' Here we just reset the timers, checking their values is done in 9005 every 100 ms
+	local timer_to_reset
+	if timer_to_reset = PICKUP_TIMER then 		' for compatibility we keep timer 4 number for pktm
+		pk_totm = _TMR_(0)
+		pk_toen = 1
+		return
+	endif
+
+	if timer_to_reset = CLOSE_ON_TIMEOUT_TIMER then 	' new timer 5, for closing on timeout
+		close_on_tm = _TMR_(0)
+		close_on_toen = 1
+		return
+	endif
+
+	' return ' we do not really need it, it is here just to mark subroutine end
+
+32360	' stop timer
+	' the timer is stopped after it has elapsed, here is just if we need
+	' to forcedly stop (disable) it
+	local timer_to_stop
+
+	if timer_to_stop = PICKUP_TIMER then pk_toen = 0 : return
+	if timer_to_stop = CLOSE_ON_TIMEOUT_TIMER then close_on_toen = 0 : return
+
+	' return ' we do not really need it, it is here just to mark subroutine end
+
+' Important !!! Put any "unnamed" functions here at the and! The code is growing,
+' and quite often happens that for the named functions (the ones defined like
+' dim function_name <gosub line_number>) cannot jump beyond the 32kB limit.
+' So, put the unnamed gunctions (the ones you call with direct gosub XXXXX statement)
+' at the end so the others can be reachable
+
+'cut-function: returns everything between
+'the first occurence of strf$ to strt$
+'(provided in the variable cut$)
+9000
+	i=instr(1,cut$,cfrom$) : y=len(cfrom$)
+	if i>0 then x=instr(i+y,cut$,cto$)
+	if and(i>0,x>0) then cut$=mid$(cut$,i+y,x-i-y) else cut$=""
+
+	return
+
+9001 'sends a SIP-message
+	
+	write SIP_CONTROL_STREAM,smsg$,0,pbxip$,pbxp
+	
+	gosub 9009 : if debug then syslog dbgtx$+req$
+'	if debug then gosub 9009 : syslog dbgtx$+req$
+
+	cut$=smsg$ : cfrom$=" " : cto$=" " : gosub 9000 'remember last uri (used in autorization)
+	if instr(1,cut$,"sip:") then lsuri$=cut$
+
+	cut$=smsg$ : cfrom$="Call-ID: " : cto$=nl$ : gosub 9000 : lstid$=cut$ 'remember last call id
+	if cut$="" then cut$=smsg$ : cfrom$="call-id: " : cto$=nl$ : gosub 9000 : lstid$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="Call-Id: " : cto$=nl$ : gosub 9000 : lstid$=cut$
+
+	if or(req$="REGISTER",req$="INVITE",and(cseqm$="INVITE",req$="200")) then  'set retransmit timer
+		lssip$=smsg$ : timer 2,3000
+	endif
+
+	smsg$="" ' smsg$ is reused in subsequent checks
+
+	return
+
+9002 'sends a NAT-keepalive
+	if call=4 then
+		write SIP_CONTROL_STREAM,"",0,pbxip$,pbxp
+		if debug then syslog "Sent NAT-Keepalive"
+	endif
+
+	'reset timer
+	nattm = _TMR_(0)
+
+	return
+
+9004 'extracts fields from a SIP message
+
+	'get CSeq-ID
+	cut$=smsg$ : cfrom$="CSeq: " : cto$ = " " : gosub 9000 : csqid=val(cut$)
+	if cut$="" then cut$=smsg$ : cfrom$="cseq: " : cto$ = " " : gosub 9000 : csqid=val(cut$)
+	if cut$="" then cut$=smsg$ : cfrom$="Cseq: " : cto$ = " " : gosub 9000 : csqid=val(cut$)
+	'get CSeq-Method
+	cut$=smsg$ : cfrom$="CSeq: "+str$(csqid) + " " : cto$=nl$ : gosub 9000 : cseqm$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="cseq: "+str$(csqid) + " " : cto$=nl$ : gosub 9000 : cseqm$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="Cseq: "+str$(csqid) + " " : cto$=nl$ : gosub 9000 : cseqm$=cut$
+	'get Call-ID
+	cut$=smsg$ : cfrom$="Call-ID: " : cto$=nl$ : gosub 9000 : calid$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="call-id: " : cto$=nl$ : gosub 9000 : calid$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="Call-Id: " : cto$=nl$ : gosub 9000 : calid$=cut$
+	'get From
+	cut$=smsg$ : cfrom$="From: " : cto$=nl$ : gosub 9000 : from$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="from: " : cto$=nl$ : gosub 9000 : from$=cut$
+	'get To
+	cut$=smsg$ : cfrom$="To: " : cto$=nl$ : gosub 9000 : to$=cut$
+	if cut$="" then cut$=smsg$ : cfrom$="to: " : cto$=nl$ : gosub 9000 : to$=cut$
+	' get the SIP method from NOTIFY (needed in blind call transfer)
+	if refer_en > 0 then
+		if req$="NOTIFY" then
+			cut$=smsg$ : cfrom$="Content-Length: " : cto$=nl$ : gosub 9000 : to$=cut$ : msg_body_len=val(to$)
+			if msg_body_len>0 then
+				sipfrag$=MID$(smsg$,len(smsg$)-msg_body_len+1,msg_body_len-1)
+			else
+				sipfrag$=""
+			endif
+			if debug then syslog "NOTIFY: "+sipfrag$
+		endif
+	endif
+	'[AD 18.04.2008] get Record-Route
+	cut$=smsg$ : cfld$="Record-Route: " : gosub 8900 : rrout$=col$
+	if cut$="" then cut$=smsg$ : cfld$="record-route: " : gosub 8900 : rrout$=col$
+	'add own tag if missing
+	if instr(1,to$,";tag=")=0 then to$=to$+";tag="+tag$
+	'[AD 18.04.2008] get more than one Via
+	cut$=smsg$ : cfld$="Via: " : gosub 8800 : via$=col$
+	if cut$="" then cut$=smsg$ : cfld$="via: " : gosub 8800 : via$=col$
+	'extract SDP fields if available
+	if instr(1,smsg$,"Content-Type: application/sdp") then gosub 5007
+	if instr(1,smsg$,"content-type: application/sdp") then gosub 5007
+	'generate authorization string if needed
+	if req$="401" then authn(1)
+	if req$="407" then authn(2)
+	'get pressed key from INFO messages
+	if req$="INFO" then cut$=smsg$ : cfrom$="Signal=" : cto$=nl$ : gosub 9000 : key$=cut$
+	'get Expires
+	if and(instr(1,smsg$,"Expires: "),cseqm$="REGISTER") then
+		cut$=smsg$ : cfrom$="Expires: " : cto$=nl$ : gosub 9000
+		'set re-register timer
+		gosub 10500 : return
+	else
+		if and(instr(1,smsg$,"expires: "),cseqm$="REGISTER") then
+			cut$=smsg$ : cfrom$="expires: " : cto$=nl$ : gosub 9000
+			'set re-register timer
+			gosub 10500 : return
+		endif
+	endif
+	'get expires from binding tag
+	if and(instr(1,smsg$,"expires="),cseqm$="REGISTER") then
+		cut$=smsg$ : cfrom$="expires=" : cto$=nl$ : gosub 9000
+		gosub 10500 'set re-register timer
+	endif
+
+	return
+
+'[AD 15.06.2008] new, ip$ should be public so trying to get it from Via "received"
+10000
+	i = instr(1, smsg$, "Via:")
+	y = instr(i, smsg$, "\r")
+
+	' getting public ip
+	if getip then
+		if and(i>0,y>0) then
+			temp$ = mid$(smsg$, i, y-i)
+			i = instr(1, temp$, "received=")
+			if i>0 then
+				y = instr(i+9, temp$, ";")
+				if y > 0 then z = y-1 else z = len(temp$)
+				pubip$ = mid$(temp$, i+9, z-(i+8))
+				if debug then syslog "Own public ip auto-detection : " + pubip$
+				getip = 0
+				' update the contact header
+				gosub 10100
+			endif
+		endif
+	endif
+
+	' getting ACK destination ip, see RFC3621 [4] diagram
+	if meth$ = "INVITE" then gosub 10050
+	gosub 10200
+
+	return
+
+'[AD 24.06.2008] get bypass url:ip:port
+10050
+	i = instr(1, smsg$, "Contact")
+	if i=0 then i=instr(1, smsg$, "contact") ' Try also HP VCX lowercase check
+	if i>0 then
+		i = instr(i, smsg$, "<")
+		y = instr(i, smsg$, ">")
+		if and(i>0, y>0) then
+			bpuri$ = mid$(smsg$, i+1, y-i-1)
+			if instr(1, bpuri$, "@") then
+				' we have ID
+				i = instr(1, bpuri$, "@")
+			else 	
+				' we have no ID (@), so skip the first ":" from "sip:"
+				i = instr(1, bpuri$, ":")
+			endif
+
+			if i>0 then
+				' find port (separated by ":" from the IP)
+				y = instr(i+1, bpuri$, ":")
+				if y>0 then
+					' ":" found, copy IP and port)
+					bpip$ = mid$(bpuri$, i+1, y-i-1)
+					bpp = val(mid$(bpuri$,y+1))	
+					' NOTE: the val command will ignore trailing string 
+					' if any (ex. ";transport=udp") after the port number
+					' so no need for additional check for ";" to detect
+					' optional params in the Contact field
+				else
+					' we have no port, so we use the default, 
+					' but first check if we have other params
+					' separated by ";"
+					y = instr(i, bpuri$, ";")
+					if y>0 then
+						' we have other params but we do not care
+						' so ignore them, just copy the IP
+						bpip$ = mid$(bpuri$,i+1, y-i-1)
+						bpp = 5060
+					else
+						' no ";" found,copy till the end
+						bpip$ = mid$(bpuri$, i+1)
+						bpp = 5060
+					endif
+				endif
+				if debug then syslog "Bypass : " + bpuri$ + " " + bpip$ + " " + str$(bpp)
+			endif
+		endif
+	endif
+
+	return
+
+' moved the "noname" functions (called with gosub) at the end as BCL kannot jump more then
+' 32k when using names
+'[AD 23.04.2008] defaults must be updated with new Contact field
+10100
+	if pubip$<>"" then temp$=pubip$ else temp$ = ip$
+
+	ctact$="Contact: <sip:"
+	ctact$=ctact$ + user$ + "@"
+	ctact$=ctact$+temp$
+	ctact$=ctact$+ ":" + str$(sipp) + ">"
+
+	szdef$="Max-Forwards: 70" + nl$
+	szdef$=szdef$+"Accept: application/sdp" + nl$
+	if refer_en <> 0 then
+		szdef$=szdef$+"Allow: INVITE,ACK,BYE,CANCEL,INFO,REFER,OPTIONS"+nl$
+	else
+		szdef$=szdef$+"Allow: INVITE,ACK,BYE,CANCEL,INFO,OPTIONS"+nl$
+	endif
+	szdef$=szdef$+ctact$+nl$
+	szdef$=szdef$+"User-Agent: Barix"+nl$
+
+	return
+
+'[AD 23.04.2008] for RTP audio, SDP ip$ fields must be updated too!
+10200
+
+	if pubip$<>"" then temp$=pubip$ else temp$=ip$
+
+	sdp$="v=0"+nl$
+	if on_hold=0 then 
+		sdp$=sdp$+"o=- 1 1 IN IP4 "+temp$+nl$
+	else
+		' for INVITE(hold) increase the session version
+		sdp$=sdp$+"o=- 1 2 IN IP4 "+temp$+nl$	
+	endif
+	sdp$=sdp$+"s=Barix SIP"+nl$+&
+		  "c=IN IP4 "+temp$+nl$+&
+		  "t=0 0"+nl$
+	if enc=7 then
+		sdp$ = sdp$+&
+		"m=audio "+str$(rtpp)+" RTP/AVP 0 101"+nl$+&
+		"a=rtpmap:0 PCMU/8000"+nl$
+	endif
+	if enc=9 then
+		sdp$=sdp$+&
+		"m=audio "+str$(rtpp)+" RTP/AVP 8 101"+nl$+&
+		"a=rtpmap:8 PCMA/8000"+nl$
+	endif
+	if enc=12 then
+		sdp$ = sdp$+&
+		"m=audio "+str$(rtpp)+" RTP/AVP 9 101"+nl$+&
+		"a=rtpmap:9 G722/8000"+nl$
+	endif
+	sdp$ = sdp$+&
+		"a=rtpmap:101 telephone-event/8000"+nl$+&
+		"a=fmtp:101 0-16"+nl$
+	if on_hold>0 then 
+		sdp$=sdp$+"a=sendonly"+nl$	' needed for INVITE(hold)
+	else
+		sdp$=sdp$+"a=sendrecv"+nl$
+	endif
+	
+	sdp$=&
+	"Content-Type: application/sdp"+nl$+&
+	"Content-Length: "+str$(len(sdp$))+nl$+nl$+sdp$
+
+	return
+
+'[AD 23.04.2008] re-registering every
+10500
+z = val(cut$) : if z<=15 then z=30
+timer 1, (z-15)*1000
+regto = (z-15)*1000
+
+return
